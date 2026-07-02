@@ -10,7 +10,7 @@ from version import VERSION
 # URL del archivo latest_version.json en el repositorio público de GitHub
 # Reemplazar TU_USUARIO con el usuario real de GitHub una vez creado el repo
 UPDATE_CHECK_URL = (
-    "https://raw.githubusercontent.com/TU_USUARIO/frutnor-sku-manager/master/latest_version.json"
+    "https://raw.githubusercontent.com/TheCanTus/frutnor-sku-manager/main/latest_version.json"
 )
 
 
