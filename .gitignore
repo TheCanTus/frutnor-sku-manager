@@ -1,0 +1,20 @@
+# Entorno virtual
+venv/
+
+# Base de datos local
+productos.db
+
+# Credenciales — nunca subir al repo
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Excel exports temporales
+excel/
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db

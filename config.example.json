@@ -1,0 +1,6 @@
+{
+  "odoo_url": "https://tu-empresa.odoo.com/",
+  "odoo_db": "nombre-de-la-base",
+  "odoo_user": "tu-email@ejemplo.com",
+  "odoo_password": "tu-api-key-de-odoo"
+}
