@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -12,8 +11,9 @@ from PySide6.QtCore import Qt, QThread, Signal
 
 from database.db import SessionLocal
 from database.models import Categoria, Presentacion, SKU, Producto
+from core.paths import get_app_dir
 
-CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+CONFIG_PATH = get_app_dir() / "config.json"
 
 
 def _cargar_config():
