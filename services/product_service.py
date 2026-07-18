@@ -2,7 +2,8 @@ from database.models import Producto, SKU, Categoria, Presentacion
 from services.sku_generator import generar_sku_base
 
 
-def crear_producto(session, nombre, categoria_id, presentaciones, grupo=None):
+def crear_producto(session, nombre, categoria_id, presentaciones, grupo=None, sku_base_override=None):
+    import re as _re
     if not nombre.strip():
         raise ValueError("El nombre del producto no puede estar vacío")
     if not presentaciones:
@@ -12,7 +13,16 @@ def crear_producto(session, nombre, categoria_id, presentaciones, grupo=None):
     if not categoria:
         raise ValueError("Categoría no encontrada")
 
-    correlativo, sku_base = generar_sku_base(session, categoria.codigo)
+    if sku_base_override:
+        sku_base = sku_base_override.strip().upper()
+        already_taken = session.query(Producto).filter_by(sku_base=sku_base).first()
+        if already_taken:
+            correlativo, sku_base = generar_sku_base(session, categoria.codigo)
+        else:
+            m = _re.match(r'^[A-Z]+(\d+)$', sku_base)
+            correlativo = int(m.group(1)) if m else 0
+    else:
+        correlativo, sku_base = generar_sku_base(session, categoria.codigo)
 
     producto = Producto(
         nombre=nombre.strip(),

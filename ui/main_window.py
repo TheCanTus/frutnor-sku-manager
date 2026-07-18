@@ -19,7 +19,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SKU Manager v1.0")
+        self.setWindowTitle("SKU Manager v1.1")
         self.resize(1100, 680)
 
         tabs = QTabWidget()

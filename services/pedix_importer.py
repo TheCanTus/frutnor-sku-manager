@@ -316,16 +316,21 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
     pres_col = next(
         (c for c in df.columns if "resentaci" in _norm(c) and "nombre" in _norm(c)), None
     )
+    sku_col = next(
+        (c for c in df.columns if "digo" in _norm(c) and "sku" in _norm(c)), None
+    )
 
     existentes_bd = {_norm(p.nombre) for p in session.query(Producto).all()}
-    existentes_sesion = set()  # nombres importados en esta sesión
+    existentes_sesion = set()
 
     importados = 0
     omitidos = []
     errores = []
-    i = 0
     filas = df.reset_index(drop=True)
 
+    # ── Fase 0: recolectar todos los bloques del archivo ─────────────────
+    blocks = []
+    i = 0
     while i < len(filas):
         row = filas.iloc[i]
         if pd.isna(row.get("ID")):
@@ -335,60 +340,15 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
         cat = str(row.get("Categoría") or row.get("Categoria", "") or "").strip()
         nombre_raw = str(row.get("Nombre", "") or "").strip()
 
-        if _debe_omitir(cat):
-            i += 1
-            continue
-
-        if not nombre_raw or "(Copia)" in nombre_raw:
+        if _debe_omitir(cat) or not nombre_raw or "(Copia)" in nombre_raw:
             i += 1
             continue
 
         nombre, embedded_pres = _extraer_pres_de_nombre(nombre_raw)
-        nombre_n = _norm(nombre)
 
-        # Duplicado dentro del mismo archivo (ya fue importado en esta sesión)
-        if nombre_n in existentes_sesion:
-            omitidos.append({
-                "nombre": nombre,
-                "motivo": f"Duplicado en el archivo (misma nombre en otra categoría: «{cat}»)",
-                "puede_forzar": False,
-            })
-            i += 1
-            continue
-
-        # Ya existe en la BD
-        if nombre_n in existentes_bd and nombre_n not in forzar_nombres:
-            omitidos.append({
-                "nombre": nombre,
-                "motivo": "Ya existe en la base de datos",
-                "puede_forzar": True,
-            })
-            i += 1
-            continue
-
-        # Buscar código de categoría: primero mapeo automático, luego extra_map del usuario
-        codigo_cat = _mapear_categoria(cat) or extra_map.get(cat)
-        if not codigo_cat:
-            omitidos.append({
-                "nombre": nombre,
-                "motivo": f"Categoría sin mapeo: «{cat}»",
-                "puede_forzar": False,
-            })
-            i += 1
-            continue
-
-        categoria = session.query(Categoria).filter_by(codigo=codigo_cat).first()
-        if not categoria:
-            omitidos.append({
-                "nombre": nombre,
-                "motivo": f"Código de categoría no encontrado en la BD: {codigo_cat}",
-                "puede_forzar": False,
-            })
-            i += 1
-            continue
-
-        # Recolectar sub-filas
+        # Recolectar sub-filas (presentaciones + SKUs de Pedix)
         sub_textos = []
+        sub_skus = []
         j = i
         while j < len(filas):
             sub = filas.iloc[j]
@@ -398,18 +358,122 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
                 pres_val = sub.get(pres_col)
                 if pd.notna(pres_val):
                     sub_textos.append(str(pres_val).strip())
+                    sku_val = sub.get(sku_col) if sku_col else None
+                    sub_skus.append(str(sku_val).strip() if pd.notna(sku_val) and sku_val else None)
             j += 1
 
-        grupo = cat
+        sku_base_pedix = None
+        for s in sub_skus:
+            if s and "-" in s:
+                sku_base_pedix = s.split("-")[0].strip().upper()
+                break
 
-        # ── Detectar si las sub-filas son variantes de nombre (sabores) ──────
+        blocks.append({
+            "nombre": nombre,
+            "nombre_n": _norm(nombre),
+            "cat": cat,
+            "embedded_pres": embedded_pres,
+            "sub_textos": sub_textos,
+            "sub_skus": sub_skus,
+            "sku_base_pedix": sku_base_pedix,
+        })
+        i = j
+
+    # ── Fase 1: procesar — primero los que tienen SKU en Pedix ───────────
+    # Así el generador secuencial nunca ocupa un número ya reservado en Pedix.
+    blocks_ordenados = (
+        [b for b in blocks if b["sku_base_pedix"]] +
+        [b for b in blocks if not b["sku_base_pedix"]]
+    )
+
+    for block in blocks_ordenados:
+        nombre        = block["nombre"]
+        nombre_n      = block["nombre_n"]
+        cat           = block["cat"]
+        embedded_pres = block["embedded_pres"]
+        sub_textos    = list(block["sub_textos"])
+        sub_skus      = list(block["sub_skus"])
+        sku_base_pedix = block["sku_base_pedix"]
+
+        # Duplicado en el archivo (mismo producto en otra categoría)
+        if nombre_n in existentes_sesion:
+            omitidos.append({
+                "nombre": nombre,
+                "motivo": f"Duplicado en el archivo (misma nombre en otra categoría: «{cat}»)",
+                "puede_forzar": False,
+            })
+            continue
+
+        # Ya existe en la BD — intentar agregar presentaciones nuevas
+        if nombre_n in existentes_bd and nombre_n not in forzar_nombres:
+            if sub_textos and not all(_es_variante_nombre(t) for t in sub_textos):
+                from services.product_service import editar_producto
+                prod = session.query(Producto).filter(
+                    Producto.nombre.ilike(nombre)
+                ).first()
+                if prod:
+                    skus_actuales = {s.presentacion for s in prod.skus}
+                    nuevas = []
+                    for p, s in zip(sub_textos, sub_skus):
+                        pc = s.split("-", 1)[1].strip().upper() if s and "-" in s else _pres_code(p)
+                        if pc not in skus_actuales and pc not in nuevas:
+                            nuevas.append(pc)
+                            agregar_presentacion_global(session, pc)
+                    if nuevas:
+                        try:
+                            editar_producto(session, prod.id, prod.nombre, prod.grupo, nuevas, [])
+                            importados += 1
+                        except Exception as e:
+                            errores.append({
+                                "nombre": nombre,
+                                "motivo": f"Error al agregar presentaciones nuevas: {e}",
+                                "puede_forzar": False,
+                            })
+                    else:
+                        omitidos.append({
+                            "nombre": nombre,
+                            "motivo": "Ya existe con las mismas presentaciones",
+                            "puede_forzar": False,
+                        })
+                else:
+                    omitidos.append({
+                        "nombre": nombre,
+                        "motivo": "Ya existe en la base de datos",
+                        "puede_forzar": True,
+                    })
+            else:
+                omitidos.append({
+                    "nombre": nombre,
+                    "motivo": "Ya existe en la base de datos",
+                    "puede_forzar": True,
+                })
+            continue
+
+        # Buscar código de categoría
+        codigo_cat = _mapear_categoria(cat) or extra_map.get(cat)
+        if not codigo_cat:
+            omitidos.append({
+                "nombre": nombre,
+                "motivo": f"Categoría sin mapeo: «{cat}»",
+                "puede_forzar": False,
+            })
+            continue
+
+        categoria = session.query(Categoria).filter_by(codigo=codigo_cat).first()
+        if not categoria:
+            omitidos.append({
+                "nombre": nombre,
+                "motivo": f"Código de categoría no encontrado en la BD: {codigo_cat}",
+                "puede_forzar": False,
+            })
+            continue
+
+        grupo = cat
         modo_variantes = bool(sub_textos) and all(_es_variante_nombre(t) for t in sub_textos)
 
         if modo_variantes:
-            # Cada sub-fila es un sabor/variante; el peso viene del nombre del producto
             pres_peso = _pres_code(embedded_pres) if embedded_pres else "1U"
             agregar_presentacion_global(session, pres_peso)
-
             n_imp, n_err = _procesar_variantes(
                 session, nombre, sub_textos, pres_peso,
                 categoria.id, grupo,
@@ -417,31 +481,30 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
             )
             importados += n_imp
             errores.extend(n_err)
-            existentes_sesion.add(nombre_n)  # evitar reprocesar el mismo base en otra categoría
+            existentes_sesion.add(nombre_n)
 
         else:
-            # Modo normal: sub-filas son presentaciones estándar
             if not sub_textos:
                 sub_textos = [embedded_pres] if embedded_pres else [None]
+                sub_skus = [None]
 
             seen_p = set()
             codigos_pres = []
-            for p in sub_textos:
-                pc = _pres_code(p)
+            for p, s in zip(sub_textos, sub_skus):
+                pc = s.split("-", 1)[1].strip().upper() if s and "-" in s else _pres_code(p)
                 if pc not in seen_p:
                     seen_p.add(pc)
                     codigos_pres.append(pc)
                     agregar_presentacion_global(session, pc)
 
             try:
-                crear_producto(session, nombre, categoria.id, codigos_pres, grupo=grupo)
+                crear_producto(session, nombre, categoria.id, codigos_pres,
+                               grupo=grupo, sku_base_override=sku_base_pedix)
                 existentes_sesion.add(nombre_n)
                 existentes_bd.add(nombre_n)
                 importados += 1
             except Exception as e:
                 errores.append({"nombre": nombre, "motivo": str(e), "puede_forzar": False})
-
-        i = j
 
     return importados, omitidos, errores
 
