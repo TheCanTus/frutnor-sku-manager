@@ -29,12 +29,15 @@ class ImportarPedixDialog(QDialog):
         tipo_layout.addWidget(QLabel("Tipo:"))
         self.rb_min = QRadioButton("Minorista")
         self.rb_may = QRadioButton("Mayorista")
+        self.rb_prev = QRadioButton("Preventista")
         self.rb_min.setChecked(True)
-        grp = QButtonGroup()
+        grp = QButtonGroup(self)
         grp.addButton(self.rb_min)
         grp.addButton(self.rb_may)
+        grp.addButton(self.rb_prev)
         tipo_layout.addWidget(self.rb_min)
         tipo_layout.addWidget(self.rb_may)
+        tipo_layout.addWidget(self.rb_prev)
         tipo_layout.addStretch()
         layout.addLayout(tipo_layout)
 
@@ -88,7 +91,11 @@ class ImportarPedixDialog(QDialog):
         layout.addLayout(btn_layout)
 
     def _tipo(self):
-        return "minorista" if self.rb_min.isChecked() else "mayorista"
+        if self.rb_may.isChecked():
+            return "mayorista"
+        if self.rb_prev.isChecked():
+            return "preventista"
+        return "minorista"
 
     def _elegir_archivo(self):
         archivo, _ = QFileDialog.getOpenFileName(
@@ -172,9 +179,30 @@ class ImportarPedixDialog(QDialog):
         self.btn_importar.setEnabled(bool(rows))
 
     def _importar(self):
+        from services.pedix_importer import escanear_nombres_sin_coincidencia, importar_desde_pedix
+        from services.nombre_alias_service import cargar_aliases, guardar_aliases
+
+        # ── Paso 1: detectar nombres sin coincidencia y pedir aliases ──
+        aliases = cargar_aliases()
+        try:
+            sin_coincidencia = escanear_nombres_sin_coincidencia(
+                self._archivo, self._tipo(), aliases=aliases
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error escaneando archivo", str(e))
+            return
+
+        if sin_coincidencia:
+            resolver = _AliasResolverDialog(sin_coincidencia, self)
+            if resolver.exec() == QDialog.Rejected:
+                return
+            nuevos = resolver.aliases_confirmados()
+            if nuevos:
+                guardar_aliases({**aliases, **nuevos})
+
+        # ── Paso 2: importar con aliases ya guardados ──
         extra_map = self._extra_map_actual()
         session = SessionLocal()
-        from services.pedix_importer import importar_desde_pedix
         try:
             importados, omitidos, errores = importar_desde_pedix(
                 session, self._archivo, self._tipo(),
@@ -197,6 +225,118 @@ class ImportarPedixDialog(QDialog):
             self._importar()
         else:
             self.accept()
+
+
+class _AliasResolverDialog(QDialog):
+    """
+    Muestra los productos del archivo Pedix que no se encontraron en la BD
+    y permite al usuario confirmar a qué producto corresponde cada uno
+    (o marcarlo como producto nuevo).
+
+    Los aliases confirmados se guardan en nombre_aliases.json y el importer
+    los usa en la siguiente ejecución.
+    """
+
+    def __init__(self, sin_coincidencia, parent=None):
+        """
+        sin_coincidencia: lista de dicts con
+            {"nombre_pedix": str, "nombre_stripped": str|None, "matches": [(score, db_nombre)]}
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Productos sin coincidencia — confirmar aliases")
+        self.setMinimumSize(820, 540)
+        self._combos = {}  # {nombre_pedix: QComboBox}
+
+        main_layout = QVBoxLayout(self)
+
+        lbl = QLabel(
+            f"Se encontraron <b>{len(sin_coincidencia)}</b> producto(s) del archivo que no "
+            "coinciden con ningún nombre en la base de datos.<br>"
+            "Para cada uno, seleccioná a qué producto de la BD corresponde, "
+            "o dejalo como <i>«Producto nuevo»</i> si debe crearse."
+        )
+        lbl.setWordWrap(True)
+        main_layout.addWidget(lbl)
+
+        # Nota sobre patrones de pack
+        nota = QLabel(
+            "<small><i>Nota: los descriptores de pack como x18u, x24u se "
+            "ignoran al buscar coincidencias &mdash; 'Chocman x18u Baño semiamargo' se "
+            "compara como 'Chocman Baño semiamargo'.</i></small>"
+        )
+        nota.setWordWrap(True)
+        main_layout.addWidget(nota)
+
+        # ── Tabla de resolución ──
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setSpacing(4)
+
+        for item in sin_coincidencia:
+            nombre_pedix = item["nombre_pedix"]
+            nombre_stripped = item["nombre_stripped"]
+            matches = item["matches"]
+
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(4, 4, 4, 4)
+
+            # Etiqueta con el nombre del archivo
+            lbl_nombre = QLabel()
+            texto = f"<b>{nombre_pedix}</b>"
+            if nombre_stripped:
+                texto += f"<br><small style='color:gray'>sin pack: <i>{nombre_stripped}</i></small>"
+            lbl_nombre.setText(texto)
+            lbl_nombre.setWordWrap(True)
+            lbl_nombre.setMinimumWidth(280)
+            lbl_nombre.setMaximumWidth(380)
+            row_layout.addWidget(lbl_nombre)
+
+            # Combo con sugerencias
+            combo = QComboBox()
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            for score, db_nombre in matches:
+                combo.addItem(f"[{score:.0%}]  {db_nombre}", db_nombre)
+            combo.addItem("— Producto nuevo (no crear alias) —", None)
+
+            # Pre-seleccionar la mejor sugerencia si supera 60 %
+            if matches and matches[0][0] >= 0.60:
+                combo.setCurrentIndex(0)
+            else:
+                combo.setCurrentIndex(len(matches))
+
+            self._combos[nombre_pedix] = combo
+            row_layout.addWidget(combo)
+
+            scroll_layout.addWidget(row_widget)
+
+        scroll_layout.addStretch()
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(scroll_widget)
+        main_layout.addWidget(scroll_area)
+
+        # ── Botones ──
+        btn_layout = QHBoxLayout()
+        btn_cancelar = QPushButton("Cancelar importación")
+        btn_cancelar.clicked.connect(self.reject)
+        btn_continuar = QPushButton("Guardar aliases y continuar")
+        btn_continuar.setDefault(True)
+        btn_continuar.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_cancelar)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_continuar)
+        main_layout.addLayout(btn_layout)
+
+    def aliases_confirmados(self):
+        """Retorna {nombre_pedix: nombre_db} para los combos donde el usuario eligió un alias."""
+        result = {}
+        for nombre_pedix, combo in self._combos.items():
+            db_nombre = combo.currentData()
+            if db_nombre is not None:
+                result[nombre_pedix] = db_nombre
+        return result
 
 
 class _ResultadoDialog(QDialog):

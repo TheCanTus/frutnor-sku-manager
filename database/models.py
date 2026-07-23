@@ -72,6 +72,8 @@ class SKU(Base):
         unique=True
     )
 
+    tiendas = Column(String, default='["minorista"]')
+
     producto = relationship(
         "Producto",
         back_populates="skus"

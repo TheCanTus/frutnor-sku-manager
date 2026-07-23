@@ -1,12 +1,27 @@
+import json
+
 from database.models import Producto, SKU, Categoria, Presentacion
 from services.sku_generator import generar_sku_base
 
 
-def crear_producto(session, nombre, categoria_id, presentaciones, grupo=None, sku_base_override=None):
+def crear_producto(session, nombre, categoria_id, presentaciones_tiendas, grupo=None,
+                   sku_base_override=None):
+    """
+    presentaciones_tiendas: dict {codigo: [tiendas]} — cada presentación con sus tiendas propias.
+    También acepta list[str] por compatibilidad (asigna ["minorista"] a todas).
+    """
     import re as _re
+
     if not nombre.strip():
         raise ValueError("El nombre del producto no puede estar vacío")
-    if not presentaciones:
+
+    # Normalizar a dict
+    if isinstance(presentaciones_tiendas, dict):
+        pres_tiendas = presentaciones_tiendas
+    else:
+        pres_tiendas = {p: ["minorista"] for p in presentaciones_tiendas}
+
+    if not pres_tiendas:
         raise ValueError("Debe seleccionar al menos una presentación")
 
     categoria = session.query(Categoria).filter_by(id=categoria_id).first()
@@ -34,18 +49,25 @@ def crear_producto(session, nombre, categoria_id, presentaciones, grupo=None, sk
     session.add(producto)
     session.flush()
 
-    for pres in presentaciones:
+    for pres, tiendas in pres_tiendas.items():
         session.add(SKU(
             producto_id=producto.id,
             presentacion=pres,
             sku=f"{sku_base}-{pres}",
+            tiendas=json.dumps(tiendas),
         ))
 
     session.commit()
     return producto
 
 
-def editar_producto(session, producto_id, nombre, grupo, agregar_pres, quitar_pres):
+def editar_producto(session, producto_id, nombre, grupo, agregar_pres, quitar_pres,
+                    actualizar_tiendas=None):
+    """
+    agregar_pres: dict {codigo: [tiendas]} o list[str] (en ese caso usa ["minorista"])
+    quitar_pres:  list[str]
+    actualizar_tiendas: dict {codigo: [tiendas]} para presentaciones existentes
+    """
     producto = session.query(Producto).filter_by(id=producto_id).first()
     if not producto:
         raise ValueError("Producto no encontrado")
@@ -62,14 +84,29 @@ def editar_producto(session, producto_id, nombre, grupo, agregar_pres, quitar_pr
         if sku:
             session.delete(sku)
 
+    # Normalizar agregar_pres a dict
+    if isinstance(agregar_pres, dict):
+        agregar_dict = agregar_pres
+    else:
+        agregar_dict = {p: ["minorista"] for p in agregar_pres}
+
     skus_actuales = {s.presentacion for s in producto.skus}
-    for pres in agregar_pres:
+    for pres, tiendas in agregar_dict.items():
         if pres not in skus_actuales:
             session.add(SKU(
                 producto_id=producto_id,
                 presentacion=pres,
                 sku=f"{producto.sku_base}-{pres}",
+                tiendas=json.dumps(tiendas),
             ))
+
+    if actualizar_tiendas:
+        for pres, tiendas in actualizar_tiendas.items():
+            sku = session.query(SKU).filter_by(
+                producto_id=producto_id, presentacion=pres
+            ).first()
+            if sku:
+                sku.tiendas = json.dumps(tiendas)
 
     session.commit()
     return producto
@@ -94,7 +131,8 @@ def agregar_presentacion_global(session, codigo, descripcion=""):
 def agregar_presentaciones_granel(session):
     """
     Agrega SKU con presentación GRL a todos los productos que tengan
-    al menos una presentación de peso (\d+(G|KG|GR)) y aún no tengan GRL.
+    al menos una presentación de peso (\\d+(G|KG|GR)) y aún no tengan GRL.
+    GRL es interno (tiendas=[]) — no se publica en ningún sitio web.
     Retorna lista de nombres de productos modificados.
     """
     import re
@@ -111,6 +149,7 @@ def agregar_presentaciones_granel(session):
             producto_id=prod.id,
             presentacion="GRL",
             sku=f"{prod.sku_base}-GRL",
+            tiendas='[]',
         ))
         agregados.append(prod.nombre)
     session.commit()

@@ -1,9 +1,14 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QComboBox, QPushButton,
-    QListWidget, QListWidgetItem, QInputDialog, QMessageBox,
+    QTableWidget, QTableWidgetItem, QInputDialog, QMessageBox,
+    QHeaderView,
 )
 from PySide6.QtCore import Qt
+
+
+_TIENDAS = ["minorista", "mayorista", "preventista"]
+_TIENDAS_HDR = ["Min", "May", "Prev"]
 
 
 class NuevoProductoDialog(QDialog):
@@ -11,7 +16,7 @@ class NuevoProductoDialog(QDialog):
     def __init__(self, categorias, presentaciones, session=None):
         super().__init__()
         self.setWindowTitle("Nuevo Producto")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(480)
         self._session = session
 
         form = QFormLayout()
@@ -35,16 +40,21 @@ class NuevoProductoDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addLayout(form)
-        layout.addWidget(QLabel("Presentaciones:"))
+        layout.addWidget(QLabel("Marcá qué tiendas venden cada presentación:"))
 
-        self.presentaciones = QListWidget()
-        self.presentaciones.setSelectionMode(QListWidget.NoSelection)
+        self.tabla = QTableWidget()
+        self.tabla.setColumnCount(4)
+        self.tabla.setHorizontalHeaderLabels(["Presentación"] + _TIENDAS_HDR)
+        self.tabla.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 4):
+            self.tabla.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.tabla.verticalHeader().setVisible(False)
+        self.tabla.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tabla.setSelectionMode(QTableWidget.NoSelection)
+        layout.addWidget(self.tabla)
+
         for pres in presentaciones:
-            item = QListWidgetItem(pres.codigo)
-            item.setToolTip(pres.descripcion)
-            item.setCheckState(Qt.Unchecked)
-            self.presentaciones.addItem(item)
-        layout.addWidget(self.presentaciones)
+            self._agregar_fila(pres.codigo, pres.descripcion or "")
 
         btn_nueva = QPushButton("＋ Nueva presentación")
         btn_nueva.clicked.connect(self._nueva_presentacion)
@@ -57,11 +67,26 @@ class NuevoProductoDialog(QDialog):
 
         self.setLayout(layout)
 
+    def _agregar_fila(self, codigo, descripcion="", tiendas_checked=None):
+        tiendas_checked = tiendas_checked or []
+        row = self.tabla.rowCount()
+        self.tabla.insertRow(row)
+
+        item_cod = QTableWidgetItem(codigo)
+        item_cod.setFlags(Qt.ItemIsEnabled)
+        item_cod.setToolTip(descripcion)
+        self.tabla.setItem(row, 0, item_cod)
+
+        for col, tienda in enumerate(_TIENDAS, 1):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Checked if tienda in tiendas_checked else Qt.Unchecked)
+            self.tabla.setItem(row, col, chk)
+
     def _actualizar_grupo(self):
         idx = self.categoria.currentIndex()
         if idx >= 0:
-            cat = self._categorias[idx]
-            self.grupo.setPlaceholderText(cat.nombre)
+            self.grupo.setPlaceholderText(self._categorias[idx].nombre)
 
     def _nueva_presentacion(self):
         codigo, ok = QInputDialog.getText(
@@ -72,18 +97,13 @@ class NuevoProductoDialog(QDialog):
             return
         codigo = codigo.strip().upper()
 
-        # Agregar a la lista visual
-        for i in range(self.presentaciones.count()):
-            if self.presentaciones.item(i).text() == codigo:
-                self.presentaciones.item(i).setCheckState(Qt.Checked)
+        for row in range(self.tabla.rowCount()):
+            if self.tabla.item(row, 0).text() == codigo:
                 return
 
-        item = QListWidgetItem(codigo)
-        item.setCheckState(Qt.Checked)
-        self.presentaciones.addItem(item)
-        self.presentaciones.scrollToBottom()
+        self._agregar_fila(codigo)
+        self.tabla.scrollToBottom()
 
-        # Persistir en BD si tenemos sesión
         if self._session:
             from services.product_service import agregar_presentacion_global
             agregar_presentacion_global(self._session, codigo)
@@ -92,23 +112,32 @@ class NuevoProductoDialog(QDialog):
         if not self.nombre.text().strip():
             QMessageBox.warning(self, "Error", "El nombre no puede estar vacío.")
             return
-        if not self.presentaciones_seleccionadas():
-            QMessageBox.warning(self, "Error", "Seleccioná al menos una presentación.")
+        if not self.presentaciones_con_tiendas():
+            QMessageBox.warning(
+                self, "Error",
+                "Marcá al menos una tienda en al menos una presentación."
+            )
             return
         self.accept()
 
-    def presentaciones_seleccionadas(self):
-        return [
-            self.presentaciones.item(i).text()
-            for i in range(self.presentaciones.count())
-            if self.presentaciones.item(i).checkState() == Qt.Checked
-        ]
+    def presentaciones_con_tiendas(self):
+        """Retorna dict {codigo: [tiendas]} solo para filas con al menos una tienda marcada."""
+        result = {}
+        for row in range(self.tabla.rowCount()):
+            codigo = self.tabla.item(row, 0).text()
+            tiendas = [
+                _TIENDAS[col]
+                for col in range(3)
+                if self.tabla.item(row, col + 1).checkState() == Qt.Checked
+            ]
+            if tiendas:
+                result[codigo] = tiendas
+        return result
 
     def grupo_texto(self):
         texto = self.grupo.text().strip()
         if texto:
             return texto
-        # Usar el nombre de la categoría como fallback
         idx = self.categoria.currentIndex()
         if idx >= 0:
             return self._categorias[idx].nombre

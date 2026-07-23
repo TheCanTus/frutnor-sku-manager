@@ -302,6 +302,8 @@ class _SubidaThread(QThread):
         from services.odoo_service import subir_skus
         from sqlalchemy.orm import joinedload
         session = SessionLocal()
+        cfg = _cargar_config()
+        website_ids = cfg.get("website_ids") or {}
         try:
             skus = (
                 session.query(SKU)
@@ -311,10 +313,38 @@ class _SubidaThread(QThread):
             creados_web, actualizados_web, creados_granel, errores = subir_skus(
                 self._url, self._db, self._uid, self._password, skus,
                 solo_nuevos=self._solo_nuevos,
+                website_ids=website_ids,
             )
         finally:
             session.close()
         self.terminado.emit(creados_web, actualizados_web, creados_granel, errores)
+
+
+class _BomThread(QThread):
+    terminado = Signal(int, int, int, list)  # creadas, actualizadas, omitidas, errores
+
+    def __init__(self, url, db, uid, password, solo_nuevos=False):
+        super().__init__()
+        self._url, self._db, self._uid, self._password = url, db, uid, password
+        self._solo_nuevos = solo_nuevos
+
+    def run(self):
+        from services.odoo_service import crear_boms
+        from sqlalchemy.orm import joinedload
+        session = SessionLocal()
+        try:
+            skus = (
+                session.query(SKU)
+                .options(joinedload(SKU.producto))
+                .all()
+            )
+            creadas, actualizadas, omitidas, errores = crear_boms(
+                self._url, self._db, self._uid, self._password, skus,
+                solo_nuevos=self._solo_nuevos,
+            )
+        finally:
+            session.close()
+        self.terminado.emit(creadas, actualizadas, omitidas, errores)
 
 
 class _OdooTab(QWidget):
@@ -357,6 +387,38 @@ class _OdooTab(QWidget):
         con_btns.addStretch()
         layout.addLayout(con_btns)
 
+        # ── Sitios web de Odoo ──
+        grp_web = QGroupBox("Sitios web de Odoo")
+        web_layout = QVBoxLayout()
+
+        web_layout.addWidget(QLabel(
+            "Ingresá el ID numérico de cada sitio web en Odoo.\n"
+            "Podés encontrarlo en: Odoo → Sitio web → Configuración → mirá el número en la URL (/odoo/websites/N)."
+        ))
+
+        btn_buscar_sitios = QPushButton("Buscar sitios automáticamente")
+        btn_buscar_sitios.clicked.connect(self._buscar_sitios)
+        web_layout.addWidget(btn_buscar_sitios)
+
+        cfg_wids = self._cfg.get("website_ids") or {}
+        web_form = QFormLayout()
+        self._inp_web_min = QLineEdit(str(cfg_wids.get("minorista") or ""))
+        self._inp_web_may = QLineEdit(str(cfg_wids.get("mayorista") or ""))
+        self._inp_web_prev = QLineEdit(str(cfg_wids.get("preventista") or ""))
+        for inp in [self._inp_web_min, self._inp_web_may, self._inp_web_prev]:
+            inp.setPlaceholderText("ID numérico (ej: 1)")
+        web_form.addRow("Minorista:", self._inp_web_min)
+        web_form.addRow("Mayorista:", self._inp_web_may)
+        web_form.addRow("Preventista:", self._inp_web_prev)
+        web_layout.addLayout(web_form)
+
+        btn_guardar_sitios = QPushButton("Guardar sitios")
+        btn_guardar_sitios.clicked.connect(self._guardar_sitios)
+        web_layout.addWidget(btn_guardar_sitios)
+
+        grp_web.setLayout(web_layout)
+        layout.addWidget(grp_web)
+
         # ── Subir a Odoo ──
         grp_sub = QGroupBox("Subir productos a Odoo")
         sub_layout = QVBoxLayout()
@@ -393,6 +455,43 @@ class _OdooTab(QWidget):
         grp_sub.setLayout(sub_layout)
         layout.addWidget(grp_sub)
 
+        # ── Listas de materiales (BoM) ──
+        grp_bom = QGroupBox("Listas de materiales (BoM)")
+        bom_layout = QVBoxLayout()
+
+        bom_layout.addWidget(QLabel(
+            "Crea las BoMs en Odoo para presentaciones de peso (G/K).\n"
+            "Requiere que los productos y sus granel ya estén subidos a Odoo."
+        ))
+
+        self.progress_bom = QProgressBar()
+        self.progress_bom.setVisible(False)
+        bom_layout.addWidget(self.progress_bom)
+
+        bom_btn_row = QHBoxLayout()
+        self.btn_boms_todas = QPushButton("Crear / actualizar todas las BoMs")
+        self.btn_boms_todas.setEnabled(False)
+        self.btn_boms_todas.setToolTip(
+            "Crea BoMs nuevas y actualiza las cantidades de las ya existentes."
+        )
+        self.btn_boms_todas.clicked.connect(self._crear_boms_todas)
+
+        self.btn_boms_nuevas = QPushButton("Solo BoMs nuevas")
+        self.btn_boms_nuevas.setEnabled(False)
+        self.btn_boms_nuevas.setToolTip(
+            "Solo crea BoMs para variantes que todavía no tienen ninguna. "
+            "No toca las existentes (ideal para sincronizar productos nuevos)."
+        )
+        self.btn_boms_nuevas.clicked.connect(self._crear_boms_nuevas)
+
+        bom_btn_row.addWidget(self.btn_boms_todas)
+        bom_btn_row.addWidget(self.btn_boms_nuevas)
+        bom_btn_row.addStretch()
+        bom_layout.addLayout(bom_btn_row)
+
+        grp_bom.setLayout(bom_layout)
+        layout.addWidget(grp_bom)
+
         # ── Comparación ──
         grp_cmp = QGroupBox("Comparar Odoo vs base de datos local")
         cmp_layout = QVBoxLayout()
@@ -416,6 +515,8 @@ class _OdooTab(QWidget):
         cmp_layout.addWidget(sub_tabs)
         grp_cmp.setLayout(cmp_layout)
         layout.addWidget(grp_cmp)
+
+        layout.addStretch()
 
     # ── helpers ──
 
@@ -446,7 +547,9 @@ class _OdooTab(QWidget):
 
     def _guardar(self):
         url, db, user, pwd = self._credenciales()
-        _guardar_config({"odoo_url": url, "odoo_db": db, "odoo_user": user, "odoo_password": pwd})
+        cfg = _cargar_config()
+        cfg.update({"odoo_url": url, "odoo_db": db, "odoo_user": user, "odoo_password": pwd})
+        _guardar_config(cfg)
         QMessageBox.information(self, "Guardado", "Configuración guardada correctamente.")
 
     def _probar(self):
@@ -462,12 +565,16 @@ class _OdooTab(QWidget):
             self.btn_subir.setEnabled(True)
             self.btn_subir_nuevos.setEnabled(True)
             self.btn_comparar.setEnabled(True)
+            self.btn_boms_todas.setEnabled(True)
+            self.btn_boms_nuevas.setEnabled(True)
             self._guardar_silencioso()
         except Exception as e:
             self._uid = None
             self.btn_subir.setEnabled(False)
             self.btn_subir_nuevos.setEnabled(False)
             self.btn_comparar.setEnabled(False)
+            self.btn_boms_todas.setEnabled(False)
+            self.btn_boms_nuevas.setEnabled(False)
             msg = str(e)
             if len(msg) > 120:
                 msg = msg[:120] + "…"
@@ -477,7 +584,68 @@ class _OdooTab(QWidget):
 
     def _guardar_silencioso(self):
         url, db, user, pwd = self._credenciales()
-        _guardar_config({"odoo_url": url, "odoo_db": db, "odoo_user": user, "odoo_password": pwd})
+        cfg = _cargar_config()
+        cfg.update({"odoo_url": url, "odoo_db": db, "odoo_user": user, "odoo_password": pwd})
+        _guardar_config(cfg)
+
+    def _buscar_sitios(self):
+        if not self._uid:
+            QMessageBox.warning(self, "Sin conexión", "Primero probá la conexión a Odoo.")
+            return
+        from services.odoo_service import listar_websites
+        url, db, _, pwd = self._credenciales()
+        try:
+            sitios = listar_websites(url, db, self._uid, pwd)
+        except Exception:
+            sitios = None
+
+        if not sitios:
+            QMessageBox.information(
+                self, "Ingreso manual",
+                "No se pudieron obtener los sitios automáticamente (permisos de API).\n\n"
+                "Ingresá el ID manualmente:\n"
+                "  1. En Odoo abrí Sitio web → Configuración\n"
+                "  2. Hacé clic en cada sitio → mirá el número en la URL: /odoo/websites/N\n\n"
+                "Ingresá ese N en el campo correspondiente y guardá."
+            )
+            return
+
+        sitios_txt = "\n".join(
+            f"  ID {s['id']}: {s['name']}  ({s.get('domain') or 'sin dominio'})"
+            for s in sitios
+        )
+        QMessageBox.information(
+            self, "Sitios encontrados",
+            f"Sitios disponibles en Odoo:\n\n{sitios_txt}\n\n"
+            "Ingresá el ID que corresponde a cada tienda en los campos de abajo y guardá."
+        )
+        # Pre-rellenar si ya hay IDs guardados que coinciden
+        cfg = _cargar_config()
+        wids = cfg.get("website_ids") or {}
+        for inp, key in [
+            (self._inp_web_min, "minorista"),
+            (self._inp_web_may, "mayorista"),
+            (self._inp_web_prev, "preventista"),
+        ]:
+            if wids.get(key) is not None and not inp.text().strip():
+                inp.setText(str(wids[key]))
+
+    def _guardar_sitios(self):
+        def _parse_id(inp):
+            txt = inp.text().strip()
+            try:
+                return int(txt) if txt else None
+            except ValueError:
+                return None
+
+        cfg = _cargar_config()
+        cfg["website_ids"] = {
+            "minorista": _parse_id(self._inp_web_min),
+            "mayorista": _parse_id(self._inp_web_may),
+            "preventista": _parse_id(self._inp_web_prev),
+        }
+        _guardar_config(cfg)
+        QMessageBox.information(self, "Guardado", "Sitios web guardados correctamente.")
 
     def _preparar_grl(self):
         from services.product_service import agregar_presentaciones_granel
@@ -527,6 +695,37 @@ class _OdooTab(QWidget):
         if errores:
             msg += f"\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
         QMessageBox.information(self, "Subida completada", msg)
+
+    def _crear_boms_todas(self):
+        self._crear_boms(solo_nuevos=False)
+
+    def _crear_boms_nuevas(self):
+        self._crear_boms(solo_nuevos=True)
+
+    def _crear_boms(self, solo_nuevos=False):
+        if not self._uid:
+            return
+        url, db, _, pwd = self._credenciales()
+        self.progress_bom.setVisible(True)
+        self.progress_bom.setRange(0, 0)
+        self.btn_boms_todas.setEnabled(False)
+        self.btn_boms_nuevas.setEnabled(False)
+        self._thread_bom = _BomThread(url, db, self._uid, pwd, solo_nuevos=solo_nuevos)
+        self._thread_bom.terminado.connect(self._on_bom_terminado)
+        self._thread_bom.start()
+
+    def _on_bom_terminado(self, creadas, actualizadas, omitidas, errores):
+        self.progress_bom.setVisible(False)
+        self.btn_boms_todas.setEnabled(True)
+        self.btn_boms_nuevas.setEnabled(True)
+        msg = (
+            f"BoMs creadas:     {creadas}\n"
+            f"BoMs actualizadas: {actualizadas}\n"
+            f"Omitidas (sin GRL en Odoo o no es peso): {omitidas}"
+        )
+        if errores:
+            msg += f"\n\nErrores ({len(errores)}):\n" + "\n".join(errores[:15])
+        QMessageBox.information(self, "BoMs completadas", msg)
 
     def _comparar(self):
         if not self._uid:

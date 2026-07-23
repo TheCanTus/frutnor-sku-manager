@@ -1,9 +1,16 @@
+import json
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout,
     QLabel, QLineEdit, QPushButton,
-    QListWidget, QListWidgetItem, QInputDialog, QMessageBox,
+    QTableWidget, QTableWidgetItem, QInputDialog, QMessageBox,
+    QHeaderView,
 )
 from PySide6.QtCore import Qt
+
+
+_TIENDAS = ["minorista", "mayorista", "preventista"]
+_TIENDAS_HDR = ["Min", "May", "Prev"]
 
 
 class EditarProductoDialog(QDialog):
@@ -11,10 +18,18 @@ class EditarProductoDialog(QDialog):
     def __init__(self, producto, todas_presentaciones, session=None):
         super().__init__()
         self.setWindowTitle("Editar Producto")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(480)
         self._session = session
         self._producto = producto
-        self._pres_originales = {s.presentacion for s in producto.skus}
+
+        # Guardamos las tiendas originales por presentación para calcular cambios
+        self._pres_orig = {}
+        for sku in producto.skus:
+            try:
+                tiendas = json.loads(sku.tiendas or "[]")
+            except (ValueError, TypeError):
+                tiendas = []
+            self._pres_orig[sku.presentacion] = tiendas
 
         form = QFormLayout()
 
@@ -31,28 +46,31 @@ class EditarProductoDialog(QDialog):
 
         layout = QVBoxLayout()
         layout.addLayout(form)
-        layout.addWidget(QLabel("Presentaciones:"))
+        layout.addWidget(QLabel("Marcá qué tiendas venden cada presentación\n(quitar todas las marcas de una fila la elimina del producto):"))
 
-        self.presentaciones = QListWidget()
-        self.presentaciones.setSelectionMode(QListWidget.NoSelection)
+        self.tabla = QTableWidget()
+        self.tabla.setColumnCount(4)
+        self.tabla.setHorizontalHeaderLabels(["Presentación"] + _TIENDAS_HDR)
+        self.tabla.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 4):
+            self.tabla.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.tabla.verticalHeader().setVisible(False)
+        self.tabla.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tabla.setSelectionMode(QTableWidget.NoSelection)
+        layout.addWidget(self.tabla)
 
-        codigos_en_lista = set()
+        codigos_en_tabla = set()
+
+        # Presentaciones existentes del producto con sus tiendas actuales
+        for pres_cod, tiendas in self._pres_orig.items():
+            self._agregar_fila(pres_cod, tiendas)
+            codigos_en_tabla.add(pres_cod)
+
+        # Presentaciones globales que el producto aún no tiene (para poder agregarlas)
         for pres in todas_presentaciones:
-            item = QListWidgetItem(pres.codigo)
-            item.setToolTip(pres.descripcion)
-            checked = pres.codigo in self._pres_originales
-            item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-            self.presentaciones.addItem(item)
-            codigos_en_lista.add(pres.codigo)
-
-        # Agregar presentaciones del producto que no estén en la lista global
-        for pres_cod in self._pres_originales:
-            if pres_cod not in codigos_en_lista:
-                item = QListWidgetItem(pres_cod)
-                item.setCheckState(Qt.Checked)
-                self.presentaciones.addItem(item)
-
-        layout.addWidget(self.presentaciones)
+            if pres.codigo not in codigos_en_tabla:
+                self._agregar_fila(pres.codigo, [], descripcion=pres.descripcion or "")
+                codigos_en_tabla.add(pres.codigo)
 
         btn_nueva = QPushButton("＋ Nueva presentación")
         btn_nueva.clicked.connect(self._nueva_presentacion)
@@ -65,6 +83,21 @@ class EditarProductoDialog(QDialog):
 
         self.setLayout(layout)
 
+    def _agregar_fila(self, codigo, tiendas_checked, descripcion=""):
+        row = self.tabla.rowCount()
+        self.tabla.insertRow(row)
+
+        item_cod = QTableWidgetItem(codigo)
+        item_cod.setFlags(Qt.ItemIsEnabled)
+        item_cod.setToolTip(descripcion)
+        self.tabla.setItem(row, 0, item_cod)
+
+        for col, tienda in enumerate(_TIENDAS, 1):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            chk.setCheckState(Qt.Checked if tienda in tiendas_checked else Qt.Unchecked)
+            self.tabla.setItem(row, col, chk)
+
     def _nueva_presentacion(self):
         codigo, ok = QInputDialog.getText(
             self, "Nueva presentación",
@@ -74,41 +107,81 @@ class EditarProductoDialog(QDialog):
             return
         codigo = codigo.strip().upper()
 
-        for i in range(self.presentaciones.count()):
-            if self.presentaciones.item(i).text() == codigo:
-                self.presentaciones.item(i).setCheckState(Qt.Checked)
+        for row in range(self.tabla.rowCount()):
+            if self.tabla.item(row, 0).text() == codigo:
                 return
 
-        item = QListWidgetItem(codigo)
-        item.setCheckState(Qt.Checked)
-        self.presentaciones.addItem(item)
-        self.presentaciones.scrollToBottom()
+        self._agregar_fila(codigo, [])
+        self.tabla.scrollToBottom()
 
         if self._session:
             from services.product_service import agregar_presentacion_global
             agregar_presentacion_global(self._session, codigo)
 
+    def _tabla_state(self):
+        """Lee el estado actual de la tabla como {codigo: [tiendas]}."""
+        state = {}
+        for row in range(self.tabla.rowCount()):
+            codigo = self.tabla.item(row, 0).text()
+            tiendas = [
+                _TIENDAS[col]
+                for col in range(3)
+                if self.tabla.item(row, col + 1).checkState() == Qt.Checked
+            ]
+            state[codigo] = tiendas
+        return state
+
     def _validar_y_aceptar(self):
         if not self.nombre.text().strip():
             QMessageBox.warning(self, "Error", "El nombre no puede estar vacío.")
             return
-        if not self.presentaciones_seleccionadas():
-            QMessageBox.warning(self, "Error", "Debe quedar al menos una presentación.")
+
+        state = self._tabla_state()
+        # Contamos cuántas presentaciones van a quedar en el producto
+        sobrevivientes = 0
+        for codigo, tiendas in state.items():
+            if codigo in self._pres_orig:
+                orig = self._pres_orig[codigo]
+                # GRL (tiendas=[]) siempre sobrevive; otros sobreviven si tienen tiendas
+                if orig == [] or tiendas:
+                    sobrevivientes += 1
+            else:
+                if tiendas:
+                    sobrevivientes += 1
+
+        if sobrevivientes == 0:
+            QMessageBox.warning(self, "Error", "El producto debe tener al menos una presentación.")
             return
+
         self.accept()
 
-    def presentaciones_seleccionadas(self):
-        return {
-            self.presentaciones.item(i).text()
-            for i in range(self.presentaciones.count())
-            if self.presentaciones.item(i).checkState() == Qt.Checked
-        }
-
     def calcular_cambios(self):
-        seleccionadas = self.presentaciones_seleccionadas()
-        agregar = seleccionadas - self._pres_originales
-        quitar = self._pres_originales - seleccionadas
-        return list(agregar), list(quitar)
+        """
+        Retorna (agregar_dict, quitar_list, actualizar_dict):
+          agregar_dict:   {codigo: [tiendas]} presentaciones nuevas
+          quitar_list:    [codigo] presentaciones a eliminar
+          actualizar_dict: {codigo: [tiendas]} presentaciones existentes con tiendas cambiadas
+        """
+        state = self._tabla_state()
+        agregar, quitar, actualizar = {}, [], {}
+
+        for codigo, tiendas_nuevas in state.items():
+            if codigo in self._pres_orig:
+                orig = self._pres_orig[codigo]
+                if orig == []:
+                    # GRL / interna: si el usuario marcó tiendas → actualizar; si sigue sin tiendas → no tocar
+                    if tiendas_nuevas:
+                        actualizar[codigo] = tiendas_nuevas
+                elif sorted(tiendas_nuevas) != sorted(orig):
+                    if tiendas_nuevas:
+                        actualizar[codigo] = tiendas_nuevas
+                    else:
+                        quitar.append(codigo)
+            else:
+                if tiendas_nuevas:
+                    agregar[codigo] = tiendas_nuevas
+
+        return agregar, quitar, actualizar
 
     def grupo_texto(self):
         texto = self.grupo.text().strip()

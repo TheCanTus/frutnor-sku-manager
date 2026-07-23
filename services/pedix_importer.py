@@ -1,7 +1,8 @@
 import re
+import json
 import unicodedata
 import pandas as pd
-from database.models import Categoria, Producto
+from database.models import Categoria, Producto, SKU
 from services.product_service import crear_producto, agregar_presentacion_global
 
 # Mapeo de categorías Pedix → código de categoría interna
@@ -126,6 +127,32 @@ def _pres_code(p):
         return "1U"
     s = str(p).strip().rstrip(".,;:")   # strip trailing punctuation (e.g. "500 gr.")
     s = s.lower().strip()
+
+    # Pack de N unidades + tamaño: "x3u NEUTRO 200cc" → "3X200C", "x6u VIRGEN 500ml" → "6X500ML"
+    # Debe evaluarse ANTES del strip del "x" inicial.
+    m_pack = re.match(
+        r"^x(\d+)u\s+.*?(\d+(?:[.,]\d+)?)\s*(kg|kgs?|k|g|gr|grs?|gramos?|ml|cc|l|litros?)(?:\b|$)",
+        s, re.IGNORECASE,
+    )
+    if m_pack:
+        mult = m_pack.group(1)
+        n    = float(m_pack.group(2).replace(",", "."))
+        u    = m_pack.group(3).lower()
+        if u in ("kg", "kgs", "k", "kilo", "kilos"):
+            sz = "1K" if n == 1 else (f"{int(n)}K" if n == int(n) else f"{n}K")
+        elif u in ("g", "gr", "grs", "gramo", "gramos"):
+            sz = f"{int(n)}G"
+        elif u == "ml":
+            sz = f"{int(n)}ML"
+        elif u == "cc":
+            sz = f"{int(n)}C"
+        elif u in ("l", "litro", "litros"):
+            sz = "1L" if n == 1 else f"{int(n)}L"
+        else:
+            sz = None
+        if sz:
+            return f"{mult}X{sz}"
+
     s = re.sub(r"^x\s*", "", s)         # strip leading "x " or "x"
 
     # Fractions: "1/2 kg" → 500G, "1/4 kg" → 250G
@@ -222,14 +249,12 @@ def previsualizar(archivo_path, tipo):
 
 
 def _procesar_variantes(session, nombre_base, variantes, pres_codigo,
-                        categoria_id, grupo, existentes_bd, existentes_sesion):
+                        categoria_id, grupo, existentes_bd, existentes_sesion, tipo='minorista'):
     """
     Para cada variante de nombre (sabor), crea el producto "{nombre_base} {variante}"
-    si no existe, o le agrega la presentación si ya existe.
+    si no existe, o le agrega/actualiza la presentación con la tienda correspondiente.
     Retorna (importados, errores).
     """
-    from services.product_service import editar_producto
-
     importados = 0
     errores = []
 
@@ -238,33 +263,39 @@ def _procesar_variantes(session, nombre_base, variantes, pres_codigo,
         nombre_v_n = _norm(nombre_v)
 
         if nombre_v_n in existentes_bd or nombre_v_n in existentes_sesion:
-            # El producto ya existe → agregarle la presentación si no la tiene
             prod = session.query(Producto).filter(
                 Producto.nombre.ilike(nombre_v)
             ).first()
             if not prod:
-                # Búsqueda por normalización
                 todos = session.query(Producto).filter_by(categoria_id=categoria_id).all()
                 prod = next((p for p in todos if _norm(p.nombre) == nombre_v_n), None)
 
             if prod:
-                skus_actuales = {s.presentacion for s in prod.skus}
-                if pres_codigo not in skus_actuales:
-                    try:
-                        editar_producto(session, prod.id, prod.nombre, prod.grupo,
-                                        [pres_codigo], [])
-                        importados += 1
-                    except Exception as e:
-                        errores.append({
-                            "nombre": nombre_v,
-                            "motivo": f"Error agregando presentación {pres_codigo}: {e}",
-                            "puede_forzar": False,
-                        })
-            # Si no encontramos el producto en la BD, no podemos hacer nada
+                skus_map = {s.presentacion: s for s in prod.skus}
+                cambio = False
+                if pres_codigo in skus_map:
+                    sku_obj = skus_map[pres_codigo]
+                    t_list = json.loads(sku_obj.tiendas or '["minorista"]')
+                    if tipo not in t_list:
+                        t_list.append(tipo)
+                        sku_obj.tiendas = json.dumps(t_list)
+                        cambio = True
+                else:
+                    agregar_presentacion_global(session, pres_codigo)
+                    session.add(SKU(
+                        producto_id=prod.id,
+                        presentacion=pres_codigo,
+                        sku=f"{prod.sku_base}-{pres_codigo}",
+                        tiendas=json.dumps([tipo]),
+                    ))
+                    cambio = True
+                if cambio:
+                    session.commit()
+                    importados += 1
         else:
-            # Crear producto nuevo
             try:
-                crear_producto(session, nombre_v, categoria_id, [pres_codigo], grupo=grupo)
+                crear_producto(session, nombre_v, categoria_id,
+                               {pres_codigo: [tipo]}, grupo=grupo)
                 existentes_sesion.add(nombre_v_n)
                 existentes_bd.add(nombre_v_n)
                 importados += 1
@@ -296,6 +327,119 @@ def escanear_categorias_sin_mapeo(archivo_path):
     return sorted(sin_mapeo)
 
 
+def escanear_nombres_sin_coincidencia(archivo_path, tipo, aliases=None):
+    """
+    Escanea el Excel de Pedix y retorna los nombres que no tienen coincidencia directa
+    en la BD (ni por alias explícito ya guardado).
+
+    Para cada nombre sin coincidencia calcula las 3 mejores sugerencias de la BD,
+    probando también la versión "stripped" (sin descriptor de pack xNu).
+
+    Retorna lista de dicts:
+        {"nombre_pedix": str, "nombre_stripped": str|None, "matches": [(score, db_nombre)]}
+    """
+    from database.db import SessionLocal
+    from services.nombre_alias_service import (
+        cargar_aliases, resolver_nombre, _strip_pack_desc, top_matches
+    )
+
+    if aliases is None:
+        aliases = cargar_aliases()
+
+    session = SessionLocal()
+    existentes_map = {_norm(p.nombre): p.nombre for p in session.query(Producto).all()}
+    session.close()
+    nombres_db_norm = list(existentes_map.keys())
+
+    df = _leer_archivo(archivo_path, tipo)
+    pres_col = next((c for c in df.columns if "resentaci" in _norm(c) and "nombre" in _norm(c)), None)
+
+    filas = df.reset_index(drop=True)
+    i = 0
+    sin_coincidencia = {}  # nombre_pedix → {"stripped": str|None, "matches": list}
+    vistos = set()
+
+    def _es_conocido(nombre):
+        canonical = resolver_nombre(nombre, aliases)
+        if _norm(canonical) in existentes_map:
+            return True
+        return False
+
+    def _registrar(nombre):
+        if nombre in vistos:
+            return
+        vistos.add(nombre)
+        if _es_conocido(nombre):
+            return
+        nombre_n = _norm(nombre)
+        stripped = _strip_pack_desc(nombre)
+        stripped_n = _norm(stripped)
+
+        # Matches sobre el nombre original
+        matches = top_matches(nombre_n, nombres_db_norm, existentes_map, n=3)
+        # Si se puede quitar el pack desc, también buscar con esa versión
+        if stripped_n != nombre_n:
+            matches_s = top_matches(stripped_n, nombres_db_norm, existentes_map, n=3)
+            seen_db = set()
+            merged = []
+            for score, db_orig in sorted(matches + matches_s, reverse=True):
+                if db_orig not in seen_db:
+                    seen_db.add(db_orig)
+                    merged.append((score, db_orig))
+            matches = merged[:3]
+        else:
+            stripped = None
+
+        sin_coincidencia[nombre] = {
+            "stripped": stripped,
+            "matches": matches,
+        }
+
+    while i < len(filas):
+        row = filas.iloc[i]
+        if pd.isna(row.get("ID")):
+            i += 1
+            continue
+
+        cat = str(row.get("Categoría") or row.get("Categoria", "") or "").strip()
+        nombre_raw = str(row.get("Nombre", "") or "").strip()
+        if _debe_omitir(cat) or not nombre_raw or "(Copia)" in nombre_raw:
+            i += 1
+            continue
+
+        nombre, embedded_pres = _extraer_pres_de_nombre(nombre_raw)
+
+        # Recolectar sub-filas para detectar modo variantes
+        sub_textos = []
+        j = i
+        while j < len(filas):
+            sub = filas.iloc[j]
+            if j > i and pd.notna(sub.get("ID")):
+                break
+            if pres_col:
+                pv = sub.get(pres_col)
+                if pd.notna(pv):
+                    sub_textos.append(str(pv).strip())
+            j += 1
+        i = j
+
+        modo_variantes = bool(sub_textos) and all(_es_variante_nombre(t) for t in sub_textos)
+        if modo_variantes:
+            for variante in sub_textos:
+                _registrar(f"{nombre} {variante}".strip())
+        else:
+            _registrar(nombre)
+
+    return [
+        {
+            "nombre_pedix": k,
+            "nombre_stripped": v["stripped"],
+            "matches": v["matches"],
+        }
+        for k, v in sorted(sin_coincidencia.items())
+    ]
+
+
 def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nombres=None):
     """
     Importa productos desde un Excel de Pedix.
@@ -308,8 +452,12 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
     Retorna (importados, omitidos_detalle, errores).
     omitidos_detalle es una lista de dicts: {"nombre", "motivo", "puede_forzar"}
     """
+    from services.nombre_alias_service import cargar_aliases, resolver_nombre
+
     extra_map = extra_map or {}
-    forzar_nombres = forzar_nombres or set()
+    # Normalize forzar_nombres so the comparison against nombre_n works
+    forzar_nombres = {_norm(n) for n in (forzar_nombres or set())}
+    aliases = cargar_aliases()
 
     df = _leer_archivo(archivo_path, tipo)
 
@@ -395,6 +543,10 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
         sub_skus      = list(block["sub_skus"])
         sku_base_pedix = block["sku_base_pedix"]
 
+        # Resolver alias: "Chocman x18u Baño semiamargo" → "Chocman Baño Semiamargo"
+        nombre_canonical = resolver_nombre(nombre, aliases)
+        nombre_n = _norm(nombre_canonical)
+
         # Duplicado en el archivo (mismo producto en otra categoría)
         if nombre_n in existentes_sesion:
             omitidos.append({
@@ -404,35 +556,47 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
             })
             continue
 
-        # Ya existe en la BD — intentar agregar presentaciones nuevas
+        # Ya existe en la BD — actualizar tiendas y agregar presentaciones nuevas
         if nombre_n in existentes_bd and nombre_n not in forzar_nombres:
             if sub_textos and not all(_es_variante_nombre(t) for t in sub_textos):
-                from services.product_service import editar_producto
                 prod = session.query(Producto).filter(
-                    Producto.nombre.ilike(nombre)
+                    Producto.nombre.ilike(nombre_canonical)
                 ).first()
+                if not prod:
+                    todos = session.query(Producto).all()
+                    prod = next((p for p in todos if _norm(p.nombre) == nombre_n), None)
                 if prod:
-                    skus_actuales = {s.presentacion for s in prod.skus}
-                    nuevas = []
+                    skus_map = {s.presentacion: s for s in prod.skus}
+                    cambios = False
+                    seen_p = set()
                     for p, s in zip(sub_textos, sub_skus):
                         pc = s.split("-", 1)[1].strip().upper() if s and "-" in s else _pres_code(p)
-                        if pc not in skus_actuales and pc not in nuevas:
-                            nuevas.append(pc)
+                        if pc in seen_p:
+                            continue
+                        seen_p.add(pc)
+                        if pc in skus_map:
+                            sku_obj = skus_map[pc]
+                            t_list = json.loads(sku_obj.tiendas or '["minorista"]')
+                            if tipo not in t_list:
+                                t_list.append(tipo)
+                                sku_obj.tiendas = json.dumps(t_list)
+                                cambios = True
+                        else:
                             agregar_presentacion_global(session, pc)
-                    if nuevas:
-                        try:
-                            editar_producto(session, prod.id, prod.nombre, prod.grupo, nuevas, [])
-                            importados += 1
-                        except Exception as e:
-                            errores.append({
-                                "nombre": nombre,
-                                "motivo": f"Error al agregar presentaciones nuevas: {e}",
-                                "puede_forzar": False,
-                            })
+                            session.add(SKU(
+                                producto_id=prod.id,
+                                presentacion=pc,
+                                sku=f"{prod.sku_base}-{pc}",
+                                tiendas=json.dumps([tipo]),
+                            ))
+                            cambios = True
+                    if cambios:
+                        session.commit()
+                        importados += 1
                     else:
                         omitidos.append({
                             "nombre": nombre,
-                            "motivo": "Ya existe con las mismas presentaciones",
+                            "motivo": "Ya existe con las mismas presentaciones y tiendas",
                             "puede_forzar": False,
                         })
                 else:
@@ -478,6 +642,7 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
                 session, nombre, sub_textos, pres_peso,
                 categoria.id, grupo,
                 existentes_bd, existentes_sesion,
+                tipo=tipo,
             )
             importados += n_imp
             errores.extend(n_err)
@@ -498,7 +663,8 @@ def importar_desde_pedix(session, archivo_path, tipo, extra_map=None, forzar_nom
                     agregar_presentacion_global(session, pc)
 
             try:
-                crear_producto(session, nombre, categoria.id, codigos_pres,
+                crear_producto(session, nombre_canonical, categoria.id,
+                               {pc: [tipo] for pc in codigos_pres},
                                grupo=grupo, sku_base_override=sku_base_pedix)
                 existentes_sesion.add(nombre_n)
                 existentes_bd.add(nombre_n)

@@ -19,6 +19,11 @@ with engine.connect() as conn:
         conn.execute(text("ALTER TABLE productos ADD COLUMN grupo VARCHAR"))
         conn.commit()
 
+    sku_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(skus)"))]
+    if "tiendas" not in sku_cols:
+        conn.execute(text('ALTER TABLE skus ADD COLUMN tiendas TEXT DEFAULT \'["minorista"]\''))
+        conn.commit()
+
 
 class _UpdateChecker(QThread):
     resultado = Signal(str, str, str)  # (version, url, notas)

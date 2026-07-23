@@ -1,10 +1,12 @@
+import json
+
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
     QMessageBox, QAbstractItemView, QFileDialog, QHeaderView,
     QTabWidget,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from sqlalchemy import or_
 
 from database.db import SessionLocal
@@ -13,6 +15,17 @@ from services.product_service import crear_producto, editar_producto, eliminar_p
 from services.excel_export import exportar_excel
 from ui.dialogs import NuevoProductoDialog
 from ui.edit_dialog import EditarProductoDialog
+
+
+_TIENDA_ABREV = {"minorista": "min", "mayorista": "may", "preventista": "prev"}
+
+
+def _fmt_tiendas(raw):
+    try:
+        lst = json.loads(raw or '["minorista"]')
+    except (ValueError, TypeError):
+        lst = ["minorista"]
+    return ", ".join(_TIENDA_ABREV.get(t, t) for t in lst) or "—"
 
 
 class MainWindow(QMainWindow):
@@ -33,17 +46,17 @@ class MainWindow(QMainWindow):
 
         # Barra de búsqueda
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Buscar por SKU, nombre o categoría...")
+        self.search.setPlaceholderText("Buscar por SKU, nombre, categoría o tienda...")
         layout.addWidget(self.search)
 
-        # Tabla: 6 columnas
+        # Tabla: 7 columnas
         self.table = QTableWidget()
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(
-            ["Categoría", "Grupo", "SKU Base", "SKU", "Producto", "Presentación"]
+            ["Tiendas", "Categoría", "Grupo", "SKU Base", "SKU", "Producto", "Presentación"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -73,8 +86,12 @@ class MainWindow(QMainWindow):
         self.settings_widget = SettingsWidget()
         tabs.addTab(self.settings_widget, "Configuración")
 
-        # Señales
-        self.search.textChanged.connect(self.buscar_productos)
+        # Señales — debounce 300 ms para no consultar en cada tecla
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self.buscar_productos)
+        self.search.textChanged.connect(self._search_timer.start)
         self.table.selectionModel().selectionChanged.connect(self._on_seleccion)
 
         self.btn_nuevo.clicked.connect(self.nuevo_producto)
@@ -98,7 +115,7 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return None
-        sku_str = self.table.item(row, 3).text()  # columna SKU
+        sku_str = self.table.item(row, 4).text()  # columna SKU (índice 4)
         sku = session.query(SKU).filter_by(sku=sku_str).first()
         return sku.producto if sku else None
 
@@ -118,6 +135,7 @@ class MainWindow(QMainWindow):
             query = query.filter(
                 or_(
                     SKU.sku.ilike(f"%{texto}%"),
+                    SKU.tiendas.ilike(f"%{texto}%"),
                     Producto.nombre.ilike(f"%{texto}%"),
                     Producto.grupo.ilike(f"%{texto}%"),
                     Categoria.codigo.ilike(f"%{texto}%"),
@@ -134,6 +152,7 @@ class MainWindow(QMainWindow):
             prod = sku.producto
             cat = prod.categoria
             valores = [
+                _fmt_tiendas(sku.tiendas),
                 cat.codigo,
                 prod.grupo or "",
                 prod.sku_base,
@@ -162,7 +181,7 @@ class MainWindow(QMainWindow):
                     session,
                     dialog.nombre.text(),
                     dialog.categoria.currentData(),
-                    dialog.presentaciones_seleccionadas(),
+                    dialog.presentaciones_con_tiendas(),
                     grupo=dialog.grupo_texto(),
                 )
                 self.cargar_productos()
@@ -177,11 +196,10 @@ class MainWindow(QMainWindow):
             session.close()
             return
         presentaciones = session.query(Presentacion).order_by(Presentacion.codigo).all()
-        # Re-obtener producto en esta sesión
         producto = session.query(Producto).filter_by(id=producto.id).first()
         dialog = EditarProductoDialog(producto, presentaciones, session=session)
         if dialog.exec():
-            agregar, quitar = dialog.calcular_cambios()
+            agregar, quitar, actualizar = dialog.calcular_cambios()
             try:
                 editar_producto(
                     session,
@@ -190,6 +208,7 @@ class MainWindow(QMainWindow):
                     dialog.grupo_texto(),
                     agregar,
                     quitar,
+                    actualizar_tiendas=actualizar,
                 )
                 self.cargar_productos()
             except ValueError as e:
@@ -199,12 +218,11 @@ class MainWindow(QMainWindow):
     def confirmar_eliminar(self):
         session = SessionLocal()
 
-        # Recolectar IDs de producto únicos de las filas seleccionadas
         filas_seleccionadas = self.table.selectionModel().selectedRows()
         producto_ids = set()
         nombres = []
         for idx in filas_seleccionadas:
-            sku_str = self.table.item(idx.row(), 3).text()
+            sku_str = self.table.item(idx.row(), 4).text()
             sku = session.query(SKU).filter_by(sku=sku_str).first()
             if sku and sku.producto_id not in producto_ids:
                 producto_ids.add(sku.producto_id)
@@ -269,9 +287,8 @@ class MainWindow(QMainWindow):
             session.close()
 
     def abrir_odoo(self):
-        # Navega a la pestaña Configuración (índice 1) → sub-pestaña Odoo (índice 2)
         tabs = self.centralWidget()
-        tabs.setCurrentIndex(1)  # pestaña Configuración
+        tabs.setCurrentIndex(1)
 
     def exportar_excel(self):
         archivo, _ = QFileDialog.getSaveFileName(

@@ -1,3 +1,5 @@
+import json
+import re as _re
 import xmlrpc.client
 
 ATTR_PRESENTACION = "Presentación"
@@ -22,6 +24,16 @@ def listar_skus_odoo(url, db, uid, password):
         {"fields": ["default_code"]},
     )
     return [r["default_code"] for r in records if r.get("default_code")]
+
+
+def listar_websites(url, db, uid, password):
+    """Retorna lista de dicts {id, name, domain} con los sitios web de Odoo."""
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    return models.execute_kw(
+        db, uid, password, "website.website", "search_read",
+        [[]],
+        {"fields": ["id", "name", "domain"]},
+    )
 
 
 def _get_or_create_attribute(models, db, uid, password):
@@ -81,7 +93,7 @@ def _find_variant_for_value(models, db, uid, password, tmpl_id, pav_id):
 
 
 def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
-    """Crea o recupera el product.template de granel (storable, sin variantes)."""
+    """Crea o recupera el product.template de granel (storable, sin variantes, sin website)."""
     nombre_granel = f"{nombre} - Granel"
     ids = models.execute_kw(db, uid, password, "product.template", "search",
         [[["name", "=", nombre_granel]]])
@@ -91,9 +103,14 @@ def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
     else:
         tmpl_id = models.execute_kw(db, uid, password, "product.template", "create", [{
             "name": nombre_granel,
-            "type": "product",
-            "sale_ok": False,
         }])
+        for type_val in ("product", "storable"):
+            try:
+                models.execute_kw(db, uid, password, "product.template", "write",
+                    [[tmpl_id], {"type": type_val, "sale_ok": False}])
+                break
+            except Exception:
+                continue
         es_nuevo = True
     variant_ids = models.execute_kw(db, uid, password, "product.product", "search",
         [[["product_tmpl_id", "=", tmpl_id]]])
@@ -103,61 +120,67 @@ def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
     return tmpl_id, es_nuevo
 
 
-def subir_skus(url, db, uid, password, skus, solo_nuevos=False):
+def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None):
     """
-    Sube SKUs a Odoo usando el sistema de variantes:
-    - Un product.template web por Producto (con variantes por presentación)
-    - Un product.template granel separado para productos con presentación GRL (storable)
-    - default_code se asigna a nivel de variante (product.product)
+    Sube SKUs a Odoo:
+    - Por cada combinación (producto × tienda): un product.template web con variantes
+    - Por cada producto con GRL: un product.template granel compartido (sin website_id)
+    - website_ids: dict {tienda: odoo_website_id}
     Retorna (creados_web, actualizados_web, creados_granel, errores).
     """
     models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
 
-    # Paso 0: filtrar solo los que no están en Odoo
     if solo_nuevos:
         existentes = set(listar_skus_odoo(url, db, uid, password))
         skus = [s for s in skus if s.sku not in existentes]
 
     attr_id = _get_or_create_attribute(models, db, uid, password)
 
-    # Paso A: agrupar por producto separando GRL del resto
-    productos_map: dict = {}
+    # Agrupar: key=(producto_id, tienda) para web; key=(producto_id, None) para granel
+    grupos: dict = {}
     for sku in skus:
         pid = sku.producto_id
-        if pid not in productos_map:
-            productos_map[pid] = {"producto": sku.producto, "web": [], "granel": None}
         if sku.presentacion == "GRL":
-            productos_map[pid]["granel"] = sku
+            key = (pid, None)
+            grupos.setdefault(key, {"producto": sku.producto, "web": [], "granel": None})
+            grupos[key]["granel"] = sku
         else:
-            productos_map[pid]["web"].append(sku)
+            tiendas_list = json.loads(sku.tiendas or '["minorista"]')
+            for tienda in tiendas_list:
+                key = (pid, tienda)
+                grupos.setdefault(key, {"producto": sku.producto, "web": [], "granel": None})
+                grupos[key]["web"].append(sku)
 
     creados_web, actualizados_web, creados_granel, errores = 0, 0, 0, []
 
-    for data in productos_map.values():
+    for (pid, tienda), data in grupos.items():
         producto = data["producto"]
         web_skus = data["web"]
         granel_sku = data["granel"]
 
         try:
-            # ── Web template (con variantes por presentación) ──
+            # ── Web template por tienda ──
             if web_skus:
                 pres_to_pav: dict[str, int] = {}
                 for sku in web_skus:
                     pres_to_pav[sku.presentacion] = _get_or_create_attr_value(
                         models, db, uid, password, attr_id, sku.presentacion)
 
-                tmpl_ids = models.execute_kw(db, uid, password, "product.template", "search",
-                    [[["name", "=", producto.nombre]]])
+                wid = (website_ids or {}).get(tienda) if tienda else None
+                domain = [["name", "=", producto.nombre]]
+                if wid:
+                    domain.append(["website_id", "=", wid])
+                tmpl_ids = models.execute_kw(db, uid, password, "product.template", "search", [domain])
 
                 if tmpl_ids:
                     tmpl_id = tmpl_ids[0]
                     es_nuevo = False
                 else:
-                    tmpl_id = models.execute_kw(db, uid, password, "product.template", "create", [{
-                        "name": producto.nombre,
-                        "type": "consu",
-                        "sale_ok": True,
-                    }])
+                    create_vals = {"name": producto.nombre, "type": "consu", "sale_ok": True}
+                    if wid:
+                        create_vals["website_id"] = wid
+                    tmpl_id = models.execute_kw(db, uid, password, "product.template", "create",
+                        [create_vals])
                     es_nuevo = True
                     creados_web += 1
 
@@ -196,7 +219,7 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False):
                     else:
                         errores.append(f"{sku.sku}: variante no encontrada en Odoo tras creación")
 
-            # ── Granel template (storable, sin variantes) ──
+            # ── Granel template (compartido, sin website_id) ──
             if granel_sku:
                 _, es_nuevo_granel = _get_or_create_granel_template(
                     models, db, uid, password, producto.nombre, granel_sku.sku)
@@ -204,6 +227,129 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False):
                     creados_granel += 1
 
         except Exception as e:
-            errores.append(f"{producto.nombre}: {e}")
+            label = f"{producto.nombre}" + (f" [{tienda}]" if tienda else " [granel]")
+            errores.append(f"{label}: {e}")
 
     return creados_web, actualizados_web, creados_granel, errores
+
+
+# ─── BoMs ────────────────────────────────────────────────────────────────────
+
+def _parse_kg(presentacion):
+    """
+    Convierte un código de presentación en kg.
+    500G → 0.5, 1K → 1.0, 250G → 0.25, 3K → 3.0
+    Retorna None si no es presentación de peso (GRL, 1U, 360C, etc.)
+    """
+    p = str(presentacion).upper().strip()
+    m = _re.match(r'^(\d+(?:[.,]\d+)?)(G|K)$', p)
+    if not m:
+        return None
+    n = float(m.group(1).replace(",", "."))
+    return round(n / 1000.0, 6) if m.group(2) == "G" else n
+
+
+def _get_uom_kg(models, db, uid, password):
+    """Busca el ID de la UoM 'kg' en Odoo."""
+    for nombre in ["kg", "Kg", "KG"]:
+        ids = models.execute_kw(db, uid, password, "uom.uom", "search",
+            [[["name", "=", nombre]]])
+        if ids:
+            return ids[0]
+    ids = models.execute_kw(db, uid, password, "uom.uom", "search",
+        [[["name", "ilike", "kg"]]])
+    return ids[0] if ids else None
+
+
+def crear_boms(url, db, uid, password, skus, solo_nuevos=False):
+    """
+    Crea o actualiza BoMs en Odoo para presentaciones de peso (G/K).
+
+    Por cada SKU de peso que tenga un granel (GRL) subido a Odoo:
+      - Busca la variante web y la variante granel por default_code
+      - Crea mrp.bom con 1 unidad producida y componente = granel con kg calculados
+      - Si ya existe una BoM para esa variante: actualiza la línea de granel
+        (omite si solo_nuevos=True)
+
+    Retorna (creadas, actualizadas, omitidas, errores).
+    """
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    uom_kg_id = _get_uom_kg(models, db, uid, password)
+
+    creadas, actualizadas, omitidas = 0, 0, 0
+    errores = []
+
+    for sku in skus:
+        if sku.presentacion == "GRL":
+            continue
+
+        kg = _parse_kg(sku.presentacion)
+        if kg is None:
+            continue
+
+        try:
+            # Variante del producto envasado
+            web_vars = models.execute_kw(
+                db, uid, password, "product.product", "search_read",
+                [[["default_code", "=", sku.sku]]],
+                {"fields": ["id", "product_tmpl_id"]},
+            )
+            if not web_vars:
+                omitidas += 1
+                continue
+            web_variant_id = web_vars[0]["id"]
+            tmpl_id = web_vars[0]["product_tmpl_id"][0]
+
+            # Variante granel del mismo producto
+            grl_code = f"{sku.producto.sku_base}-GRL"
+            grl_vars = models.execute_kw(
+                db, uid, password, "product.product", "search_read",
+                [[["default_code", "=", grl_code]]],
+                {"fields": ["id"]},
+            )
+            if not grl_vars:
+                omitidas += 1
+                continue
+            grl_variant_id = grl_vars[0]["id"]
+
+            line_vals = {"product_id": grl_variant_id, "product_qty": kg}
+            if uom_kg_id:
+                line_vals["product_uom_id"] = uom_kg_id
+
+            # ¿Ya existe una BoM para esta variante?
+            existing = models.execute_kw(
+                db, uid, password, "mrp.bom", "search",
+                [[["product_id", "=", web_variant_id]]],
+            )
+
+            if existing:
+                if solo_nuevos:
+                    omitidas += 1
+                    continue
+                bom_id = existing[0]
+                # Buscar la línea de granel dentro de la BoM
+                lines = models.execute_kw(
+                    db, uid, password, "mrp.bom.line", "search",
+                    [[["bom_id", "=", bom_id], ["product_id", "=", grl_variant_id]]],
+                )
+                if lines:
+                    models.execute_kw(db, uid, password, "mrp.bom.line", "write",
+                        [lines, {"product_qty": kg}])
+                else:
+                    models.execute_kw(db, uid, password, "mrp.bom.line", "create",
+                        [{**line_vals, "bom_id": bom_id}])
+                actualizadas += 1
+            else:
+                models.execute_kw(db, uid, password, "mrp.bom", "create", [{
+                    "product_tmpl_id": tmpl_id,
+                    "product_id": web_variant_id,
+                    "product_qty": 1,
+                    "type": "normal",
+                    "bom_line_ids": [(0, 0, line_vals)],
+                }])
+                creadas += 1
+
+        except Exception as e:
+            errores.append(f"{sku.sku}: {e}")
+
+    return creadas, actualizadas, omitidas, errores
