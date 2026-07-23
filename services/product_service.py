@@ -89,3 +89,29 @@ def agregar_presentacion_global(session, codigo, descripcion=""):
     if not existe:
         session.add(Presentacion(codigo=codigo.upper(), descripcion=descripcion))
         session.commit()
+
+
+def agregar_presentaciones_granel(session):
+    """
+    Agrega SKU con presentación GRL a todos los productos que tengan
+    al menos una presentación de peso (\d+(G|KG|GR)) y aún no tengan GRL.
+    Retorna lista de nombres de productos modificados.
+    """
+    import re
+    _PESO = re.compile(r'^\d+(G|KG|GR)$', re.IGNORECASE)
+    productos = session.query(Producto).all()
+    agregados = []
+    for prod in productos:
+        codigos = {s.presentacion for s in prod.skus}
+        if "GRL" in codigos:
+            continue
+        if not any(_PESO.match(c) for c in codigos):
+            continue
+        session.add(SKU(
+            producto_id=prod.id,
+            presentacion="GRL",
+            sku=f"{prod.sku_base}-GRL",
+        ))
+        agregados.append(prod.nombre)
+    session.commit()
+    return agregados

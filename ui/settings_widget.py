@@ -291,11 +291,12 @@ class _ComparacionThread(QThread):
 
 
 class _SubidaThread(QThread):
-    terminado = Signal(int, int, list)
+    terminado = Signal(int, int, int, list)  # creados_web, actualizados_web, creados_granel, errores
 
-    def __init__(self, url, db, uid, password):
+    def __init__(self, url, db, uid, password, solo_nuevos=False):
         super().__init__()
         self._url, self._db, self._uid, self._password = url, db, uid, password
+        self._solo_nuevos = solo_nuevos
 
     def run(self):
         from services.odoo_service import subir_skus
@@ -307,12 +308,13 @@ class _SubidaThread(QThread):
                 .options(joinedload(SKU.producto))
                 .all()
             )
-            creados, actualizados, errores = subir_skus(
-                self._url, self._db, self._uid, self._password, skus
+            creados_web, actualizados_web, creados_granel, errores = subir_skus(
+                self._url, self._db, self._uid, self._password, skus,
+                solo_nuevos=self._solo_nuevos,
             )
         finally:
             session.close()
-        self.terminado.emit(creados, actualizados, errores)
+        self.terminado.emit(creados_web, actualizados_web, creados_granel, errores)
 
 
 class _OdooTab(QWidget):
@@ -358,13 +360,36 @@ class _OdooTab(QWidget):
         # ── Subir a Odoo ──
         grp_sub = QGroupBox("Subir productos a Odoo")
         sub_layout = QVBoxLayout()
+
         self.progress_sub = QProgressBar()
         self.progress_sub.setVisible(False)
+        sub_layout.addWidget(self.progress_sub)
+
+        btn_row1 = QHBoxLayout()
+        self.btn_preparar_grl = QPushButton("Preparar GRL (granel)")
+        self.btn_preparar_grl.setToolTip(
+            "Agrega presentación GRL a todos los productos de peso que aún no la tengan."
+        )
+        self.btn_preparar_grl.clicked.connect(self._preparar_grl)
+        btn_row1.addWidget(self.btn_preparar_grl)
+        btn_row1.addStretch()
+        sub_layout.addLayout(btn_row1)
+
+        btn_row2 = QHBoxLayout()
         self.btn_subir = QPushButton("Subir todos los SKUs")
         self.btn_subir.setEnabled(False)
         self.btn_subir.clicked.connect(self._subir)
-        sub_layout.addWidget(self.progress_sub)
-        sub_layout.addWidget(self.btn_subir)
+        self.btn_subir_nuevos = QPushButton("Subir solo nuevos")
+        self.btn_subir_nuevos.setEnabled(False)
+        self.btn_subir_nuevos.setToolTip(
+            "Solo sube los SKUs que todavía no están en Odoo (más rápido para sincronizaciones)."
+        )
+        self.btn_subir_nuevos.clicked.connect(self._subir_nuevos)
+        btn_row2.addWidget(self.btn_subir)
+        btn_row2.addWidget(self.btn_subir_nuevos)
+        btn_row2.addStretch()
+        sub_layout.addLayout(btn_row2)
+
         grp_sub.setLayout(sub_layout)
         layout.addWidget(grp_sub)
 
@@ -435,11 +460,13 @@ class _OdooTab(QWidget):
             self.lbl_estado.setText("✔ Conexión exitosa")
             self.lbl_estado.setStyleSheet("color: green;")
             self.btn_subir.setEnabled(True)
+            self.btn_subir_nuevos.setEnabled(True)
             self.btn_comparar.setEnabled(True)
             self._guardar_silencioso()
         except Exception as e:
             self._uid = None
             self.btn_subir.setEnabled(False)
+            self.btn_subir_nuevos.setEnabled(False)
             self.btn_comparar.setEnabled(False)
             msg = str(e)
             if len(msg) > 120:
@@ -452,21 +479,51 @@ class _OdooTab(QWidget):
         url, db, user, pwd = self._credenciales()
         _guardar_config({"odoo_url": url, "odoo_db": db, "odoo_user": user, "odoo_password": pwd})
 
-    def _subir(self):
+    def _preparar_grl(self):
+        from services.product_service import agregar_presentaciones_granel
+        session = SessionLocal()
+        try:
+            agregados = agregar_presentaciones_granel(session)
+        finally:
+            session.close()
+        if agregados:
+            lista = "\n".join(f"  • {n}" for n in agregados[:30])
+            if len(agregados) > 30:
+                lista += f"\n  … y {len(agregados) - 30} más"
+            QMessageBox.information(
+                self, "Presentaciones GRL agregadas",
+                f"Se agregó GRL a {len(agregados)} producto(s):\n\n{lista}",
+            )
+        else:
+            QMessageBox.information(
+                self, "Sin cambios",
+                "Todos los productos de peso ya tienen presentación GRL, o no hay productos de peso en la base de datos.",
+            )
+
+    def _subir(self, solo_nuevos=False):
         if not self._uid:
             return
         url, db, _, pwd = self._credenciales()
         self.progress_sub.setVisible(True)
         self.progress_sub.setRange(0, 0)
         self.btn_subir.setEnabled(False)
-        self._thread_sub = _SubidaThread(url, db, self._uid, pwd)
+        self.btn_subir_nuevos.setEnabled(False)
+        self._thread_sub = _SubidaThread(url, db, self._uid, pwd, solo_nuevos=solo_nuevos)
         self._thread_sub.terminado.connect(self._on_subida_terminada)
         self._thread_sub.start()
 
-    def _on_subida_terminada(self, creados, actualizados, errores):
+    def _subir_nuevos(self):
+        self._subir(solo_nuevos=True)
+
+    def _on_subida_terminada(self, creados_web, actualizados_web, creados_granel, errores):
         self.progress_sub.setVisible(False)
         self.btn_subir.setEnabled(True)
-        msg = f"Creados: {creados}\nActualizados: {actualizados}"
+        self.btn_subir_nuevos.setEnabled(True)
+        msg = (
+            f"Templates web creados: {creados_web}\n"
+            f"Variantes actualizadas: {actualizados_web}\n"
+            f"Templates granel creados: {creados_granel}"
+        )
         if errores:
             msg += f"\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
         QMessageBox.information(self, "Subida completada", msg)
