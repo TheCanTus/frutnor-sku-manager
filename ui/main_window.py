@@ -1,5 +1,6 @@
 import json
 
+from version import VERSION
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
@@ -32,7 +33,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SKU Manager v1.1")
+        self.setWindowTitle(f"SKU Manager v{VERSION}")
         self.resize(1100, 680)
 
         tabs = QTabWidget()
