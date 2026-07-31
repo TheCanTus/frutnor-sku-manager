@@ -82,10 +82,17 @@ class MainWindow(QMainWindow):
         self.btn_eliminar.setEnabled(False)
         layout.addLayout(btn_bar)
 
+        # ── Pestaña Precios ──
+        from ui.precios_widget import PreciosWidget
+        self.precios_widget = PreciosWidget()
+        tabs.addTab(self.precios_widget, "Precios")
+
         # ── Pestaña Configuración ──
         from ui.settings_widget import SettingsWidget
         self.settings_widget = SettingsWidget()
         tabs.addTab(self.settings_widget, "Configuración")
+
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         # Señales — debounce 300 ms para no consultar en cada tecla
         self._search_timer = QTimer(self)
@@ -106,6 +113,13 @@ class MainWindow(QMainWindow):
         self.cargar_productos()
 
     # ─── Helpers ────────────────────────────────────────────────
+
+    def _on_tab_changed(self, index):
+        tabs = self.centralWidget()
+        if tabs.widget(index) is self.precios_widget:
+            # Carga inicial o refresco si no hay cambios pendientes
+            if not self.precios_widget._sku_ids or not self.precios_widget._cambios:
+                self.precios_widget.cargar()
 
     def _on_seleccion(self):
         filas = len(self.table.selectionModel().selectedRows())

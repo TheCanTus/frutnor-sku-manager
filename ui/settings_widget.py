@@ -320,6 +320,34 @@ class _SubidaThread(QThread):
         self.terminado.emit(creados_web, actualizados_web, creados_granel, errores)
 
 
+class _PreciosThread(QThread):
+    terminado = Signal(int, int, list)  # actualizados, sin_precio, errores
+
+    def __init__(self, url, db, uid, password):
+        super().__init__()
+        self._url, self._db, self._uid, self._password = url, db, uid, password
+
+    def run(self):
+        from services.odoo_service import subir_precios
+        from sqlalchemy.orm import joinedload
+        session = SessionLocal()
+        cfg = _cargar_config()
+        website_ids = cfg.get("website_ids") or {}
+        try:
+            skus = (
+                session.query(SKU)
+                .options(joinedload(SKU.producto))
+                .all()
+            )
+            actualizados, sin_precio, errores = subir_precios(
+                self._url, self._db, self._uid, self._password, skus,
+                website_ids=website_ids,
+            )
+        finally:
+            session.close()
+        self.terminado.emit(actualizados, sin_precio, errores)
+
+
 class _BomThread(QThread):
     terminado = Signal(int, int, int, list)  # creadas, actualizadas, omitidas, errores
 
@@ -452,6 +480,18 @@ class _OdooTab(QWidget):
         btn_row2.addStretch()
         sub_layout.addLayout(btn_row2)
 
+        btn_row3 = QHBoxLayout()
+        self.btn_subir_precios = QPushButton("Actualizar precios en Odoo")
+        self.btn_subir_precios.setEnabled(False)
+        self.btn_subir_precios.setToolTip(
+            "Actualiza list_price y price_extra en los templates ya existentes en Odoo.\n"
+            "No crea ni elimina productos — solo aplica los precios cargados en la pestaña Precios."
+        )
+        self.btn_subir_precios.clicked.connect(self._subir_precios)
+        btn_row3.addWidget(self.btn_subir_precios)
+        btn_row3.addStretch()
+        sub_layout.addLayout(btn_row3)
+
         grp_sub.setLayout(sub_layout)
         layout.addWidget(grp_sub)
 
@@ -564,6 +604,7 @@ class _OdooTab(QWidget):
             self.lbl_estado.setStyleSheet("color: green;")
             self.btn_subir.setEnabled(True)
             self.btn_subir_nuevos.setEnabled(True)
+            self.btn_subir_precios.setEnabled(True)
             self.btn_comparar.setEnabled(True)
             self.btn_boms_todas.setEnabled(True)
             self.btn_boms_nuevas.setEnabled(True)
@@ -572,6 +613,7 @@ class _OdooTab(QWidget):
             self._uid = None
             self.btn_subir.setEnabled(False)
             self.btn_subir_nuevos.setEnabled(False)
+            self.btn_subir_precios.setEnabled(False)
             self.btn_comparar.setEnabled(False)
             self.btn_boms_todas.setEnabled(False)
             self.btn_boms_nuevas.setEnabled(False)
@@ -682,6 +724,28 @@ class _OdooTab(QWidget):
 
     def _subir_nuevos(self):
         self._subir(solo_nuevos=True)
+
+    def _subir_precios(self):
+        if not self._uid:
+            return
+        url, db, _, pwd = self._credenciales()
+        self.progress_sub.setVisible(True)
+        self.progress_sub.setRange(0, 0)
+        self.btn_subir_precios.setEnabled(False)
+        self._thread_precios = _PreciosThread(url, db, self._uid, pwd)
+        self._thread_precios.terminado.connect(self._on_precios_terminado)
+        self._thread_precios.start()
+
+    def _on_precios_terminado(self, actualizados, sin_precio, errores):
+        self.progress_sub.setVisible(False)
+        self.btn_subir_precios.setEnabled(True)
+        msg = (
+            f"Templates actualizados: {actualizados}\n"
+            f"Sin precio cargado (omitidos): {sin_precio}"
+        )
+        if errores:
+            msg += f"\n\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
+        QMessageBox.information(self, "Precios actualizados", msg)
 
     def _on_subida_terminada(self, creados_web, actualizados_web, creados_granel, errores):
         self.progress_sub.setVisible(False)

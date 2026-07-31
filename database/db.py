@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from core.paths import get_app_dir
@@ -13,3 +13,15 @@ SessionLocal = sessionmaker(
     autoflush=False,
     bind=engine,
 )
+
+
+def _migraciones():
+    """Aplica columnas nuevas que no existen en la DB actual."""
+    with engine.connect() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(skus)")).fetchall()}
+        if "precios" not in cols:
+            conn.execute(text("ALTER TABLE skus ADD COLUMN precios TEXT DEFAULT '{}'"))
+            conn.commit()
+
+
+_migraciones()

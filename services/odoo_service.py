@@ -92,6 +92,30 @@ def _find_variant_for_value(models, db, uid, password, tmpl_id, pav_id):
     return None
 
 
+def _set_variant_price_extra(models, db, uid, password, tmpl_id, pav_id, price_extra):
+    """Fija price_extra en el product.template.attribute.value correspondiente."""
+    ptav_ids = models.execute_kw(db, uid, password,
+        "product.template.attribute.value", "search",
+        [[["product_tmpl_id", "=", tmpl_id],
+          ["product_attribute_value_id", "=", pav_id]]])
+    if ptav_ids:
+        models.execute_kw(db, uid, password,
+            "product.template.attribute.value", "write",
+            [ptav_ids, {"price_extra": round(price_extra, 2)}])
+
+
+def _get_or_create_public_category(models, db, uid, password, nombre, cache):
+    """Busca o crea una product.public.category por nombre. Usa cache para evitar llamadas repetidas."""
+    if nombre in cache:
+        return cache[nombre]
+    ids = models.execute_kw(db, uid, password, "product.public.category", "search",
+        [[["name", "=ilike", nombre]]])
+    categ_id = ids[0] if ids else models.execute_kw(
+        db, uid, password, "product.public.category", "create", [{"name": nombre}])
+    cache[nombre] = categ_id
+    return categ_id
+
+
 def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
     """Crea o recupera el product.template de granel (storable, sin variantes, sin website)."""
     nombre_granel = f"{nombre} - Granel"
@@ -123,8 +147,9 @@ def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
 def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None):
     """
     Sube SKUs a Odoo:
-    - Por cada combinación (producto × tienda): un product.template web con variantes
-    - Por cada producto con GRL: un product.template granel compartido (sin website_id)
+    - Un product.template por (producto × tienda) con variantes por presentación.
+      Todas las tiendas usan este flujo: minorista, mayorista y preventista.
+    - Granel: un product.template compartido sin website_id.
     - website_ids: dict {tienda: odoo_website_id}
     Retorna (creados_web, actualizados_web, creados_granel, errores).
     """
@@ -132,7 +157,13 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
 
     if solo_nuevos:
         existentes = set(listar_skus_odoo(url, db, uid, password))
-        skus = [s for s in skus if s.sku not in existentes]
+        # Los SKUs preventistas siempre se procesan: su template en el sitio preventista
+        # puede no existir aunque el default_code ya esté asignado en otro template (minorista).
+        skus = [
+            s for s in skus
+            if s.sku not in existentes
+            or "preventista" in json.loads(s.tiendas or "[]")
+        ]
 
     attr_id = _get_or_create_attribute(models, db, uid, password)
 
@@ -152,6 +183,7 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
                 grupos[key]["web"].append(sku)
 
     creados_web, actualizados_web, creados_granel, errores = 0, 0, 0, []
+    categ_cache: dict = {}
 
     for (pid, tienda), data in grupos.items():
         producto = data["producto"]
@@ -159,14 +191,14 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
         granel_sku = data["granel"]
 
         try:
-            # ── Web template por tienda ──
-            if web_skus:
+            # ── Template con variantes (todas las tiendas: minorista, mayorista, preventista) ──
+            if tienda and web_skus:
                 pres_to_pav: dict[str, int] = {}
                 for sku in web_skus:
                     pres_to_pav[sku.presentacion] = _get_or_create_attr_value(
                         models, db, uid, password, attr_id, sku.presentacion)
 
-                wid = (website_ids or {}).get(tienda) if tienda else None
+                wid = (website_ids or {}).get(tienda)
                 domain = [["name", "=", producto.nombre]]
                 if wid:
                     domain.append(["website_id", "=", wid])
@@ -176,13 +208,32 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
                     tmpl_id = tmpl_ids[0]
                     es_nuevo = False
                 else:
-                    create_vals = {"name": producto.nombre, "type": "consu", "sale_ok": True}
+                    create_vals = {"name": producto.nombre, "sale_ok": True}
                     if wid:
                         create_vals["website_id"] = wid
                     tmpl_id = models.execute_kw(db, uid, password, "product.template", "create",
                         [create_vals])
+                    # Odoo 17+: "storable" | Odoo ≤16: "product"
+                    for type_val in ("storable", "product"):
+                        try:
+                            models.execute_kw(db, uid, password, "product.template", "write",
+                                [[tmpl_id], {"type": type_val}])
+                            break
+                        except Exception:
+                            continue
                     es_nuevo = True
                     creados_web += 1
+
+                # Asignar categoría web
+                cat = getattr(producto, "categoria", None)
+                if cat and cat.nombre:
+                    try:
+                        categ_id = _get_or_create_public_category(
+                            models, db, uid, password, cat.nombre, categ_cache)
+                        models.execute_kw(db, uid, password, "product.template", "write",
+                            [[tmpl_id], {"public_categ_ids": [(4, categ_id)]}])
+                    except Exception as e:
+                        errores.append(f"{producto.nombre}: no se pudo asignar categoría ({e})")
 
                 line_ids = models.execute_kw(db, uid, password,
                     "product.template.attribute.line", "search",
@@ -219,6 +270,22 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
                     else:
                         errores.append(f"{sku.sku}: variante no encontrada en Odoo tras creación")
 
+                # Precios: list_price en template + price_extra por variante
+                tienda_precios = {}
+                for sku in web_skus:
+                    p = json.loads(sku.precios or '{}')
+                    precio = p.get(tienda)
+                    if precio and float(precio) > 0:
+                        tienda_precios[sku.presentacion] = float(precio)
+                if tienda_precios:
+                    base = min(tienda_precios.values())
+                    models.execute_kw(db, uid, password, "product.template", "write",
+                        [[tmpl_id], {"list_price": base}])
+                    for sku in web_skus:
+                        pav_id = pres_to_pav[sku.presentacion]
+                        extra = tienda_precios.get(sku.presentacion, base) - base
+                        _set_variant_price_extra(models, db, uid, password, tmpl_id, pav_id, extra)
+
             # ── Granel template (compartido, sin website_id) ──
             if granel_sku:
                 _, es_nuevo_granel = _get_or_create_granel_template(
@@ -233,15 +300,90 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
     return creados_web, actualizados_web, creados_granel, errores
 
 
+def subir_precios(url, db, uid, password, skus, website_ids=None):
+    """
+    Actualiza list_price y price_extra en templates ya existentes en Odoo.
+    No crea ni elimina templates ni variantes.
+    Retorna (actualizados, sin_precio, errores).
+    """
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    attr_id = _get_or_create_attribute(models, db, uid, password)
+
+    grupos: dict = {}
+    for sku in skus:
+        if sku.presentacion == "GRL":
+            continue
+        tiendas_list = json.loads(sku.tiendas or '["minorista"]')
+        for tienda in tiendas_list:
+            key = (sku.producto_id, tienda)
+            grupos.setdefault(key, {"producto": sku.producto, "web": []})
+            grupos[key]["web"].append(sku)
+
+    actualizados, sin_precio, errores = 0, 0, []
+
+    for (pid, tienda), data in grupos.items():
+        producto = data["producto"]
+        web_skus = data["web"]
+
+        tienda_precios = {}
+        for sku in web_skus:
+            p = json.loads(sku.precios or '{}')
+            precio = p.get(tienda)
+            if precio and float(precio) > 0:
+                tienda_precios[sku.presentacion] = float(precio)
+
+        if not tienda_precios:
+            sin_precio += 1
+            continue
+
+        try:
+            wid = (website_ids or {}).get(tienda)
+            domain = [["name", "=", producto.nombre]]
+            if wid:
+                domain.append(["website_id", "=", wid])
+            tmpl_ids = models.execute_kw(db, uid, password, "product.template", "search", [domain])
+            if not tmpl_ids:
+                errores.append(f"{producto.nombre} [{tienda}]: template no encontrado en Odoo")
+                continue
+            tmpl_id = tmpl_ids[0]
+
+            pres_to_pav = {}
+            for sku in web_skus:
+                pres_to_pav[sku.presentacion] = _get_or_create_attr_value(
+                    models, db, uid, password, attr_id, sku.presentacion)
+
+            base = min(tienda_precios.values())
+            models.execute_kw(db, uid, password, "product.template", "write",
+                [[tmpl_id], {"list_price": base}])
+            for sku in web_skus:
+                pav_id = pres_to_pav[sku.presentacion]
+                extra = tienda_precios.get(sku.presentacion, base) - base
+                _set_variant_price_extra(models, db, uid, password, tmpl_id, pav_id, extra)
+            actualizados += 1
+
+        except Exception as e:
+            errores.append(f"{producto.nombre} [{tienda}]: {e}")
+
+    return actualizados, sin_precio, errores
+
+
 # ─── BoMs ────────────────────────────────────────────────────────────────────
 
 def _parse_kg(presentacion):
     """
     Convierte un código de presentación en kg.
-    500G → 0.5, 1K → 1.0, 250G → 0.25, 3K → 3.0
-    Retorna None si no es presentación de peso (GRL, 1U, 360C, etc.)
+    500G → 0.5  |  1K → 1.0  |  10X100G → 1.0  |  5X200G → 1.0
+    Retorna None si no es presentación de peso (GRL, 1U, 360C, 3X200C, etc.)
     """
     p = str(presentacion).upper().strip()
+    # Pack de gramos: NXsizeG (e.g. 10X100G = 10 × 100g = 1 kg)
+    m_pack = _re.match(r'^(\d+)X(\d+(?:[.,]\d+)?)(G|K)$', p)
+    if m_pack:
+        n_units = int(m_pack.group(1))
+        size = float(m_pack.group(2).replace(",", "."))
+        grams = size if m_pack.group(3) == "G" else size * 1000
+        return round(n_units * grams / 1000, 6)
+    # Presentación simple: 500G, 1K, etc.
     m = _re.match(r'^(\d+(?:[.,]\d+)?)(G|K)$', p)
     if not m:
         return None
