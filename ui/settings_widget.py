@@ -532,6 +532,23 @@ class _OdooTab(QWidget):
         grp_bom.setLayout(bom_layout)
         layout.addWidget(grp_bom)
 
+        # ── Actualizaciones ──
+        grp_upd = QGroupBox("Actualizaciones automáticas")
+        upd_layout = QFormLayout()
+        self._inp_gh_token = QLineEdit(self._cfg.get("github_token", ""))
+        self._inp_gh_token.setEchoMode(QLineEdit.Password)
+        self._inp_gh_token.setPlaceholderText("ghp_xxxx… (solo para repositorios privados)")
+        self._inp_gh_token.setToolTip(
+            "Personal Access Token de GitHub con permiso 'Contents: Read'.\n"
+            "Dejá vacío si el repositorio es público."
+        )
+        upd_layout.addRow("GitHub Token:", self._inp_gh_token)
+        btn_guardar_token = QPushButton("Guardar token")
+        btn_guardar_token.clicked.connect(self._guardar_token)
+        upd_layout.addRow("", btn_guardar_token)
+        grp_upd.setLayout(upd_layout)
+        layout.addWidget(grp_upd)
+
         # ── Comparación ──
         grp_cmp = QGroupBox("Comparar Odoo vs base de datos local")
         cmp_layout = QVBoxLayout()
@@ -759,6 +776,12 @@ class _OdooTab(QWidget):
         if errores:
             msg += f"\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
         QMessageBox.information(self, "Subida completada", msg)
+
+    def _guardar_token(self):
+        cfg = _cargar_config()
+        cfg["github_token"] = self._inp_gh_token.text().strip()
+        _guardar_config(cfg)
+        QMessageBox.information(self, "Guardado", "Token guardado correctamente.")
 
     def _crear_boms_todas(self):
         self._crear_boms(solo_nuevos=False)

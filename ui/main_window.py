@@ -5,9 +5,9 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QTableWidget, QTableWidgetItem,
     QMessageBox, QAbstractItemView, QFileDialog, QHeaderView,
-    QTabWidget,
+    QTabWidget, QLabel, QProgressDialog,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from sqlalchemy import or_
 
 from database.db import SessionLocal
@@ -19,6 +19,23 @@ from ui.edit_dialog import EditarProductoDialog
 
 
 _TIENDA_ABREV = {"minorista": "min", "mayorista": "may", "preventista": "prev"}
+
+
+class _UpdateChecker(QThread):
+    resultado = Signal(object)  # (version, url, notas) o None
+
+    def run(self):
+        try:
+            from core.paths import get_app_dir
+            import json as _json
+            cfg_path = get_app_dir() / "config.json"
+            token = ""
+            if cfg_path.exists():
+                token = _json.loads(cfg_path.read_text(encoding="utf-8")).get("github_token", "")
+            from services.updater import verificar_actualizacion
+            self.resultado.emit(verificar_actualizacion(token=token))
+        except Exception:
+            self.resultado.emit(None)
 
 
 def _fmt_tiendas(raw):
@@ -110,7 +127,22 @@ class MainWindow(QMainWindow):
         self.btn_exportar.clicked.connect(self.exportar_excel)
         self.btn_bom.clicked.connect(self.exportar_boms)
 
+        # Banner de actualización (oculto hasta que se detecte versión nueva)
+        self._update_info = None
+        self._update_banner = QLabel("")
+        self._update_banner.setAlignment(Qt.AlignCenter)
+        self._update_banner.setStyleSheet(
+            "background:#1a6b3c; color:white; padding:6px; font-weight:bold; cursor:pointer;"
+        )
+        self._update_banner.setCursor(Qt.PointingHandCursor)
+        self._update_banner.setVisible(False)
+        self._update_banner.mousePressEvent = lambda _: self._aplicar_actualizacion()
+        layout.addWidget(self._update_banner)
+
         self.cargar_productos()
+
+        # Verificar actualizaciones 5 s después de abrir (sin bloquear el inicio)
+        QTimer.singleShot(5000, self._verificar_actualizacion)
 
     # ─── Helpers ────────────────────────────────────────────────
 
@@ -319,3 +351,59 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", str(e))
         finally:
             session.close()
+
+    # ─── Actualizaciones ────────────────────────────────────────
+
+    def _verificar_actualizacion(self):
+        self._checker = _UpdateChecker(self)
+        self._checker.resultado.connect(self._on_update_resultado)
+        self._checker.start()
+
+    def _on_update_resultado(self, resultado):
+        if not resultado:
+            return
+        version, url, notas = resultado
+        self._update_info = (version, url, notas)
+        self._update_banner.setText(
+            f"  Nueva versión disponible: v{version}  —  Hacé clic aquí para actualizar  "
+        )
+        self._update_banner.setVisible(True)
+
+    def _aplicar_actualizacion(self):
+        if not self._update_info:
+            return
+        version, url, notas = self._update_info
+        msg = f"Versión disponible: {version}\n\n"
+        if notas:
+            msg += f"Novedades:\n{notas[:600]}\n\n"
+        msg += "¿Descargar e instalar ahora? El programa se cerrará y se reabrirá automáticamente."
+        resp = QMessageBox.question(self, "Actualizar SKU Manager", msg,
+                                    QMessageBox.Yes | QMessageBox.No)
+        if resp != QMessageBox.Yes:
+            return
+
+        progress = QProgressDialog("Descargando actualización…", None, 0, 100, self)
+        progress.setWindowTitle("Actualizando")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        try:
+            from core.paths import get_app_dir
+            import json as _json
+            cfg_path = get_app_dir() / "config.json"
+            token = ""
+            if cfg_path.exists():
+                token = _json.loads(cfg_path.read_text(encoding="utf-8")).get("github_token", "")
+
+            from services.updater import descargar_e_instalar
+            descargar_e_instalar(url, token=token, progreso_callback=progress.setValue)
+            progress.close()
+            QMessageBox.information(
+                self, "Listo",
+                "Descarga completa. El programa se cerrará y la nueva versión se abrirá en segundos."
+            )
+            self.close()
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Error al actualizar", str(e))
