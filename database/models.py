@@ -2,6 +2,7 @@ from sqlalchemy import (
     Column,
     Integer,
     String,
+    Float,
     DateTime,
     ForeignKey
 )
@@ -47,6 +48,9 @@ class Producto(Base):
         DateTime,
         default=datetime.now
     )
+
+    stock = Column(Float, nullable=True)
+    stock_unidad = Column(String, default='kg')
 
     skus = relationship(
         "SKU",

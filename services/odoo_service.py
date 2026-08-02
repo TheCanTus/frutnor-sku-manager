@@ -367,6 +367,113 @@ def subir_precios(url, db, uid, password, skus, website_ids=None):
     return actualizados, sin_precio, errores
 
 
+# ─── Stock ───────────────────────────────────────────────────────────────────
+
+def _get_stock_location(models, db, uid, password):
+    """Retorna el ID de la ubicación de stock interno principal (WH/Stock)."""
+    for name in ["Stock", "stock"]:
+        ids = models.execute_kw(db, uid, password, "stock.location", "search",
+            [[["usage", "=", "internal"], ["name", "=", name]]], {"limit": 1})
+        if ids:
+            return ids[0]
+    ids = models.execute_kw(db, uid, password, "stock.location", "search",
+        [[["usage", "=", "internal"]]], {"limit": 1})
+    return ids[0] if ids else None
+
+
+def descargar_stock(url, db_odoo, uid, password, producto_skus):
+    """
+    Descarga stock actual de Odoo agrupado por producto.
+    producto_skus: {producto_id: [sku_code, ...]}
+    Retorna {producto_id: qty_total} (suma de todas las variantes).
+    """
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    loc_id = _get_stock_location(models, db_odoo, uid, password)
+    if not loc_id:
+        raise ValueError("No se encontró ubicación de stock interno en Odoo.")
+
+    sku_to_pid = {}
+    for pid, codes in producto_skus.items():
+        for code in codes:
+            sku_to_pid[code] = pid
+
+    all_codes = list(sku_to_pid.keys())
+    if not all_codes:
+        return {}
+
+    result = {}
+    for i in range(0, len(all_codes), 100):
+        batch = all_codes[i:i + 100]
+        prods = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
+            [[["default_code", "in", batch]]],
+            {"fields": ["id", "default_code"]})
+        if not prods:
+            continue
+        odoo_pid_to_sku = {p["id"]: p["default_code"] for p in prods}
+        odoo_ids = list(odoo_pid_to_sku.keys())
+        quants = models.execute_kw(db_odoo, uid, password, "stock.quant", "search_read",
+            [[["product_id", "in", odoo_ids], ["location_id", "=", loc_id]]],
+            {"fields": ["product_id", "quantity"]})
+        for q in quants:
+            odoo_pid = q["product_id"][0]
+            sku_code = odoo_pid_to_sku.get(odoo_pid, "")
+            app_pid = sku_to_pid.get(sku_code)
+            if app_pid is not None:
+                result[app_pid] = result.get(app_pid, 0.0) + q["quantity"]
+
+    return result
+
+
+def actualizar_stock(url, db_odoo, uid, password, items):
+    """
+    Actualiza stock en Odoo mediante ajuste de inventario.
+    items: [(nombre, qty, [sku_codes])]
+    Asigna qty a la primera variante de cada producto; pone las demás en 0.
+    Retorna (actualizados, errores).
+    """
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    loc_id = _get_stock_location(models, db_odoo, uid, password)
+    if not loc_id:
+        raise ValueError("No se encontró ubicación de stock interno en Odoo.")
+
+    actualizados, errores = 0, []
+
+    for nombre, qty, sku_codes in items:
+        if not sku_codes:
+            continue
+        try:
+            prods = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
+                [[["default_code", "in", sku_codes]]],
+                {"fields": ["id"]})
+            if not prods:
+                errores.append(f"{nombre}: no encontrado en Odoo")
+                continue
+
+            variant_ids = [p["id"] for p in prods]
+
+            for i, vid in enumerate(variant_ids):
+                target = qty if i == 0 else 0.0
+                existing = models.execute_kw(db_odoo, uid, password, "stock.quant", "search",
+                    [[["product_id", "=", vid], ["location_id", "=", loc_id]]])
+                if existing:
+                    models.execute_kw(db_odoo, uid, password, "stock.quant", "write",
+                        [existing, {"inventory_quantity": target}])
+                    models.execute_kw(db_odoo, uid, password, "stock.quant",
+                        "action_apply_inventory", [existing])
+                elif target > 0:
+                    new_id = models.execute_kw(db_odoo, uid, password, "stock.quant", "create",
+                        [{"product_id": vid, "location_id": loc_id,
+                          "inventory_quantity": target}])
+                    models.execute_kw(db_odoo, uid, password, "stock.quant",
+                        "action_apply_inventory", [[new_id]])
+
+            actualizados += 1
+        except Exception as e:
+            errores.append(f"{nombre}: {e}")
+
+    return actualizados, errores
+
+
 # ─── BoMs ────────────────────────────────────────────────────────────────────
 
 def _parse_kg(presentacion):

@@ -104,6 +104,11 @@ class MainWindow(QMainWindow):
         self.precios_widget = PreciosWidget()
         tabs.addTab(self.precios_widget, "Precios")
 
+        # ── Pestaña Stock ──
+        from ui.stock_widget import StockWidget
+        self.stock_widget = StockWidget()
+        tabs.addTab(self.stock_widget, "Stock")
+
         # ── Pestaña Configuración ──
         from ui.settings_widget import SettingsWidget
         self.settings_widget = SettingsWidget()
@@ -148,10 +153,13 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index):
         tabs = self.centralWidget()
-        if tabs.widget(index) is self.precios_widget:
-            # Carga inicial o refresco si no hay cambios pendientes
+        widget = tabs.widget(index)
+        if widget is self.precios_widget:
             if not self.precios_widget._sku_ids or not self.precios_widget._cambios:
                 self.precios_widget.cargar()
+        elif widget is self.stock_widget:
+            if not self.stock_widget._producto_ids or not self.stock_widget._cambios:
+                self.stock_widget.cargar()
 
     def _on_seleccion(self):
         filas = len(self.table.selectionModel().selectedRows())
@@ -335,7 +343,8 @@ class MainWindow(QMainWindow):
 
     def abrir_odoo(self):
         tabs = self.centralWidget()
-        tabs.setCurrentIndex(1)
+        # Configuración es la última pestaña (índice 3: Productos, Precios, Stock, Configuración)
+        tabs.setCurrentIndex(3)
 
     def exportar_excel(self):
         archivo, _ = QFileDialog.getSaveFileName(
