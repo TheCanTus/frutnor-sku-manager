@@ -43,6 +43,7 @@ class SettingsWidget(QWidget):
 
         tabs.addTab(_CategoriasTab(), "Categorías")
         tabs.addTab(_PresentacionesTab(), "Presentaciones")
+        tabs.addTab(_BaseDatosTab(), "Base de datos")
         self._odoo_tab = _OdooTab()
         tabs.addTab(self._odoo_tab, "Odoo")
 
@@ -263,6 +264,87 @@ class _PresentacionesTab(QWidget):
                 session.commit()
         session.close()
         self._cargar()
+
+
+# ──────────────────────────────────────────────────────────────
+class _BaseDatosTab(QWidget):
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(16)
+        self.setLayout(layout)
+
+        grp = QGroupBox("Conexión a la base de datos")
+        form = QFormLayout()
+        form.setContentsMargins(10, 12, 10, 12)
+        form.setSpacing(10)
+
+        cfg = _cargar_config()
+        self._inp_url = QLineEdit(cfg.get("db_url", ""))
+        self._inp_url.setPlaceholderText(
+            "postgresql://usuario:password@host:5432/db   —   vacío = SQLite local"
+        )
+        self._inp_url.setEchoMode(QLineEdit.Normal)
+        form.addRow("URL:", self._inp_url)
+
+        self._lbl_estado = QLabel("")
+        self._lbl_estado.setWordWrap(True)
+        form.addRow("Estado:", self._lbl_estado)
+
+        btns = QHBoxLayout()
+        btn_guardar = QPushButton("Guardar")
+        btn_guardar.clicked.connect(self._guardar)
+        btn_test = QPushButton("Probar conexión")
+        btn_test.clicked.connect(self._probar)
+        btns.addWidget(btn_guardar)
+        btns.addWidget(btn_test)
+        btns.addStretch()
+        form.addRow("", btns)
+
+        grp.setLayout(form)
+        layout.addWidget(grp)
+
+        info = QLabel(
+            "• Dejá el campo vacío para usar la base de datos local (SQLite).\n"
+            "• Para Supabase usá la URL del Session Pooler (puerto 5432).\n"
+            "• El cambio aplica la próxima vez que se abre la aplicación."
+        )
+        info.setStyleSheet("color: gray; font-size: 11px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        layout.addStretch()
+
+    def _guardar(self):
+        url = self._inp_url.text().strip()
+        cfg = _cargar_config()
+        cfg["db_url"] = url
+        _guardar_config(cfg)
+        QMessageBox.information(
+            self, "Guardado",
+            "URL guardada. Reiniciá la aplicación para aplicar el cambio."
+        )
+
+    def _probar(self):
+        url = self._inp_url.text().strip()
+        if not url:
+            self._lbl_estado.setText("Sin URL — se usará SQLite local.")
+            self._lbl_estado.setStyleSheet("color: gray;")
+            return
+        try:
+            from sqlalchemy import create_engine, text
+            engine = create_engine(url, pool_pre_ping=True, connect_args={})
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            self._lbl_estado.setText("✔ Conexión exitosa")
+            self._lbl_estado.setStyleSheet("color: green;")
+        except Exception as e:
+            msg = str(e)
+            if len(msg) > 120:
+                msg = msg[:120] + "…"
+            self._lbl_estado.setText(f"✘ {msg}")
+            self._lbl_estado.setStyleSheet("color: red;")
 
 
 # ── Threads ────────────────────────────────────────────────────
