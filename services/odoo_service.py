@@ -7,7 +7,7 @@ ATTR_PRESENTACION = "Presentación"
 
 def conectar(url, db, user, password):
     """Autentica contra Odoo. Retorna uid o lanza excepción."""
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
+    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
     uid = common.authenticate(db, user, password, {})
     if not uid:
         raise ValueError("Credenciales incorrectas o base de datos no encontrada.")
@@ -16,7 +16,7 @@ def conectar(url, db, user, password):
 
 def listar_skus_odoo(url, db, uid, password):
     """Retorna lista de default_code de todos los product.product (variantes) en Odoo."""
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     records = models.execute_kw(
         db, uid, password,
         "product.product", "search_read",
@@ -28,7 +28,7 @@ def listar_skus_odoo(url, db, uid, password):
 
 def listar_websites(url, db, uid, password):
     """Retorna lista de dicts {id, name, domain} con los sitios web de Odoo."""
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     return models.execute_kw(
         db, uid, password, "website.website", "search_read",
         [[]],
@@ -116,7 +116,27 @@ def _get_or_create_public_category(models, db, uid, password, nombre, cache):
     return categ_id
 
 
-def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
+def _set_storable(models, db, uid, password, tmpl_ids):
+    """
+    Marca product.template(s) como Almacenable.
+    Odoo 17+/19: is_storable=True  (campo 'Track Inventory')
+    Odoo 16:     type='product'
+    """
+    if not tmpl_ids:
+        return
+    ids = tmpl_ids if isinstance(tmpl_ids, list) else [tmpl_ids]
+    for campo, valor in (("is_storable", True),
+                         ("detailed_type", "storable"),
+                         ("type", "product")):
+        try:
+            models.execute_kw(db, uid, password, "product.template", "write",
+                [ids, {campo: valor}])
+            return
+        except Exception:
+            continue
+
+
+def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code, uom_id=None):
     """Crea o recupera el product.template de granel (storable, sin variantes, sin website)."""
     nombre_granel = f"{nombre} - Granel"
     ids = models.execute_kw(db, uid, password, "product.template", "search",
@@ -125,16 +145,14 @@ def _get_or_create_granel_template(models, db, uid, password, nombre, sku_code):
         tmpl_id = ids[0]
         es_nuevo = False
     else:
-        tmpl_id = models.execute_kw(db, uid, password, "product.template", "create", [{
-            "name": nombre_granel,
-        }])
-        for type_val in ("product", "storable"):
-            try:
-                models.execute_kw(db, uid, password, "product.template", "write",
-                    [[tmpl_id], {"type": type_val, "sale_ok": False}])
-                break
-            except Exception:
-                continue
+        vals = {"name": nombre_granel}
+        if uom_id:
+            vals["uom_id"] = uom_id
+            vals["uom_po_id"] = uom_id
+        tmpl_id = models.execute_kw(db, uid, password, "product.template", "create", [vals])
+        _set_storable(models, db, uid, password, tmpl_id)
+        models.execute_kw(db, uid, password, "product.template", "write",
+            [[tmpl_id], {"sale_ok": False}])
         es_nuevo = True
     variant_ids = models.execute_kw(db, uid, password, "product.product", "search",
         [[["product_tmpl_id", "=", tmpl_id]]])
@@ -153,7 +171,7 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
     - website_ids: dict {tienda: odoo_website_id}
     Retorna (creados_web, actualizados_web, creados_granel, errores).
     """
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
 
     if solo_nuevos:
         existentes = set(listar_skus_odoo(url, db, uid, password))
@@ -213,14 +231,7 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
                         create_vals["website_id"] = wid
                     tmpl_id = models.execute_kw(db, uid, password, "product.template", "create",
                         [create_vals])
-                    # Odoo 17+: "storable" | Odoo ≤16: "product"
-                    for type_val in ("storable", "product"):
-                        try:
-                            models.execute_kw(db, uid, password, "product.template", "write",
-                                [[tmpl_id], {"type": type_val}])
-                            break
-                        except Exception:
-                            continue
+                    _set_storable(models, db, uid, password, tmpl_id)
                     es_nuevo = True
                     creados_web += 1
 
@@ -288,8 +299,20 @@ def subir_skus(url, db, uid, password, skus, solo_nuevos=False, website_ids=None
 
             # ── Granel template (compartido, sin website_id) ──
             if granel_sku:
+                # Determinar UoM del granel según otras presentaciones
+                from services.bom_exporter import _parse_pres as _pp
+                _grl_uom_id = None
+                for _s in producto.skus:
+                    _parsed = _pp(_s.presentacion)
+                    if _parsed and _parsed[1] == "weight" and _parsed[0] != float("inf"):
+                        _grl_uom_id = _get_uom_kg(models, db, uid, password)
+                        break
+                    if _parsed and _parsed[1] == "volume" and _parsed[0] != float("inf"):
+                        _grl_uom_id = _get_uom_liter(models, db, uid, password)
+                        break
                 _, es_nuevo_granel = _get_or_create_granel_template(
-                    models, db, uid, password, producto.nombre, granel_sku.sku)
+                    models, db, uid, password, producto.nombre, granel_sku.sku,
+                    uom_id=_grl_uom_id)
                 if es_nuevo_granel:
                     creados_granel += 1
 
@@ -306,7 +329,7 @@ def subir_precios(url, db, uid, password, skus, website_ids=None):
     No crea ni elimina templates ni variantes.
     Retorna (actualizados, sin_precio, errores).
     """
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     attr_id = _get_or_create_attribute(models, db, uid, password)
 
     grupos: dict = {}
@@ -387,7 +410,7 @@ def descargar_stock(url, db_odoo, uid, password, producto_skus):
     producto_skus: {producto_id: [sku_code, ...]}
     Retorna {producto_id: qty_total} (suma de todas las variantes).
     """
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     loc_id = _get_stock_location(models, db_odoo, uid, password)
     if not loc_id:
         raise ValueError("No se encontró ubicación de stock interno en Odoo.")
@@ -424,19 +447,49 @@ def descargar_stock(url, db_odoo, uid, password, producto_skus):
     return result
 
 
+def convertir_consumibles_a_almacenable(url, db_odoo, uid, password, sku_codes_all):
+    """
+    Busca en Odoo los productos con SKU en sku_codes_all que sean consumibles
+    y los convierte a Almacenable (storable). Retorna (convertidos, errores).
+    """
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
+
+    # Buscar no-almacenables: is_storable=False (Odoo 17+/19) o type=consu (Odoo 16)
+    tmpl_id_set = set()
+    for domain_extra in (["is_storable", "=", False], ["type", "=", "consu"]):
+        try:
+            prods = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
+                [[["default_code", "in", sku_codes_all], domain_extra]],
+                {"fields": ["id", "product_tmpl_id"]})
+            for p in prods:
+                tmpl_id_set.add(p["product_tmpl_id"][0])
+            if tmpl_id_set:
+                break
+        except Exception:
+            continue
+
+    if not tmpl_id_set:
+        return 0, []
+
+    tmpl_ids = list(tmpl_id_set)
+    _set_storable(models, db_odoo, uid, password, tmpl_ids)
+    return len(tmpl_ids), []
+
+
 def actualizar_stock(url, db_odoo, uid, password, items):
     """
     Actualiza stock en Odoo mediante ajuste de inventario.
     items: [(nombre, qty, [sku_codes])]
-    Asigna qty a la primera variante de cada producto; pone las demás en 0.
-    Retorna (actualizados, errores).
+    Asigna qty a la primera variante storable; pone las demás en 0.
+    Retorna (actualizados, errores, omitidos).
+    omitidos: productos encontrados pero no almacenables en Odoo.
     """
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     loc_id = _get_stock_location(models, db_odoo, uid, password)
     if not loc_id:
         raise ValueError("No se encontró ubicación de stock interno en Odoo.")
 
-    actualizados, errores = 0, []
+    actualizados, errores, omitidos = 0, [], []
 
     for nombre, qty, sku_codes in items:
         if not sku_codes:
@@ -444,34 +497,53 @@ def actualizar_stock(url, db_odoo, uid, password, items):
         try:
             prods = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
                 [[["default_code", "in", sku_codes]]],
-                {"fields": ["id"]})
+                {"fields": ["id", "default_code", "is_storable", "type"]})
             if not prods:
                 errores.append(f"{nombre}: no encontrado en Odoo")
                 continue
 
-            variant_ids = [p["id"] for p in prods]
+            def _es_storable(p):
+                if "is_storable" in p:
+                    return bool(p["is_storable"])
+                return p.get("type") == "product"
 
-            for i, vid in enumerate(variant_ids):
-                target = qty if i == 0 else 0.0
+            storables = [p for p in prods if _es_storable(p)]
+            if not storables:
+                tipo = prods[0].get("type", "?")
+                label = {"consu": "consumible", "service": "servicio"}.get(tipo, tipo)
+                omitidos.append(f"{nombre} (tipo: {label})")
+                continue
+
+            # Elegir variante base: GRL (granel) > 1U > la primera
+            def _base_variant_id(variants):
+                by_code = {(p.get("default_code") or "").upper(): p["id"] for p in variants}
+                for code, vid in by_code.items():
+                    if code.endswith("-GRL"):
+                        return vid
+                for code, vid in by_code.items():
+                    if code.endswith("-1U"):
+                        return vid
+                return variants[0]["id"]
+
+            base_id = _base_variant_id(storables)
+
+            for p in storables:
+                vid = p["id"]
+                target = float(qty) if vid == base_id else 0.0
                 existing = models.execute_kw(db_odoo, uid, password, "stock.quant", "search",
                     [[["product_id", "=", vid], ["location_id", "=", loc_id]]])
                 if existing:
                     models.execute_kw(db_odoo, uid, password, "stock.quant", "write",
-                        [existing, {"inventory_quantity": target}])
-                    models.execute_kw(db_odoo, uid, password, "stock.quant",
-                        "action_apply_inventory", [existing])
+                        [existing, {"quantity": target}])
                 elif target > 0:
-                    new_id = models.execute_kw(db_odoo, uid, password, "stock.quant", "create",
-                        [{"product_id": vid, "location_id": loc_id,
-                          "inventory_quantity": target}])
-                    models.execute_kw(db_odoo, uid, password, "stock.quant",
-                        "action_apply_inventory", [[new_id]])
+                    models.execute_kw(db_odoo, uid, password, "stock.quant", "create",
+                        [{"product_id": vid, "location_id": loc_id, "quantity": target}])
 
             actualizados += 1
         except Exception as e:
             errores.append(f"{nombre}: {e}")
 
-    return actualizados, errores
+    return actualizados, errores, omitidos
 
 
 # ─── BoMs ────────────────────────────────────────────────────────────────────
@@ -510,6 +582,52 @@ def _get_uom_kg(models, db, uid, password):
     return ids[0] if ids else None
 
 
+def _get_uom_unit(models, db, uid, password):
+    """Busca el ID de la UoM de unidades en Odoo."""
+    for nombre in ["Unidades", "Units", "Unit(s)", "Unidad"]:
+        ids = models.execute_kw(db, uid, password, "uom.uom", "search",
+            [[["name", "=", nombre]]])
+        if ids:
+            return ids[0]
+    ids = models.execute_kw(db, uid, password, "uom.uom", "search",
+        [[["name", "ilike", "nidad"]]])
+    return ids[0] if ids else None
+
+
+def _get_uom_liter(models, db, uid, password):
+    """Busca el ID de la UoM de litros en Odoo."""
+    for nombre in ["Litro(s)", "Litre(s)", "Litros", "Litro", "L"]:
+        ids = models.execute_kw(db, uid, password, "uom.uom", "search",
+            [[["name", "=", nombre]]])
+        if ids:
+            return ids[0]
+    ids = models.execute_kw(db, uid, password, "uom.uom", "search",
+        [[["name", "ilike", "litro"]]])
+    return ids[0] if ids else None
+
+
+def _parse_bom_qty(cantidad, uom_unit, uom_kg, uom_liter):
+    """
+    Parsea la cantidad de un BoM y retorna (qty_float, uom_id).
+    Retorna (None, None) si no se puede parsear o hay que verificar.
+    """
+    if isinstance(cantidad, (int, float)):
+        return float(cantidad), uom_unit
+    s = str(cantidad).strip()
+    if not s or "verificar" in s or s.startswith("—"):
+        return None, None
+    m = _re.match(r"^(\d+(?:\.\d+)?)\s*g$", s, _re.IGNORECASE)
+    if m:
+        return float(m.group(1)) / 1000.0, uom_kg
+    m = _re.match(r"^(\d+(?:\.\d+)?)\s*ml$", s, _re.IGNORECASE)
+    if m:
+        return float(m.group(1)) / 1000.0, (uom_liter or uom_kg)
+    try:
+        return float(s), uom_unit
+    except (ValueError, TypeError):
+        return None, None
+
+
 def crear_boms(url, db, uid, password, skus, solo_nuevos=False):
     """
     Crea o actualiza BoMs en Odoo para presentaciones de peso (G/K).
@@ -522,7 +640,7 @@ def crear_boms(url, db, uid, password, skus, solo_nuevos=False):
 
     Retorna (creadas, actualizadas, omitidas, errores).
     """
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
     uom_kg_id = _get_uom_kg(models, db, uid, password)
 
     creadas, actualizadas, omitidas = 0, 0, 0
@@ -600,5 +718,187 @@ def crear_boms(url, db, uid, password, skus, solo_nuevos=False):
 
         except Exception as e:
             errores.append(f"{sku.sku}: {e}")
+
+    return creadas, actualizadas, omitidas, errores
+
+
+def corregir_uom_granel(url, db_odoo, uid, password, productos):
+    """
+    Corrige la UoM de productos GRL en Odoo:
+      - Granel de peso (tiene presentaciones G/K) → kg
+      - Granel de volumen (tiene presentaciones ML/CC/L) → L
+    Para cada uno: vacía el quant, cambia UoM, restaura el stock.
+    Retorna (actualizados, sin_cambio, errores).
+    """
+    from services.bom_exporter import _parse_pres
+
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
+    uom_kg = _get_uom_kg(models, db_odoo, uid, password)
+    uom_liter = _get_uom_liter(models, db_odoo, uid, password)
+
+    actualizados, sin_cambio = 0, 0
+    errores = []
+
+    for producto in productos:
+        skus = producto.skus
+        grl_skus = [s for s in skus if s.presentacion == "GRL"]
+        if not grl_skus:
+            continue
+
+        # Determinar tipo desde otras presentaciones
+        tipo = None
+        for s in skus:
+            parsed = _parse_pres(s.presentacion)
+            if parsed and parsed[1] == "weight" and parsed[0] != float("inf"):
+                tipo = "weight"
+                break
+            if parsed and parsed[1] == "volume" and parsed[0] != float("inf"):
+                tipo = "volume"
+                break
+        if tipo is None:
+            sin_cambio += 1
+            continue
+
+        uom_id = uom_kg if tipo == "weight" else uom_liter
+        if not uom_id:
+            sin_cambio += 1
+            continue
+
+        grl_code = f"{producto.sku_base}-GRL"
+        try:
+            prods = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
+                [[["default_code", "=", grl_code]]],
+                {"fields": ["id", "product_tmpl_id", "uom_id"]})
+            if not prods:
+                sin_cambio += 1
+                continue
+
+            current_uom_id = prods[0]["uom_id"][0] if prods[0].get("uom_id") else None
+            if current_uom_id == uom_id:
+                sin_cambio += 1
+                continue
+
+            prod_id = prods[0]["id"]
+            tmpl_id = prods[0]["product_tmpl_id"][0]
+
+            # Leer stock actual
+            loc_ids = models.execute_kw(db_odoo, uid, password, "stock.location", "search",
+                [[["usage", "=", "internal"]]])
+            quants = models.execute_kw(db_odoo, uid, password, "stock.quant", "search_read",
+                [[["product_id", "=", prod_id], ["location_id", "in", loc_ids]]],
+                {"fields": ["id", "quantity", "location_id"]})
+
+            # Vaciar stock temporalmente
+            for q in quants:
+                models.execute_kw(db_odoo, uid, password, "stock.quant", "write",
+                    [[q["id"]], {"quantity": 0.0}])
+
+            # Cambiar UoM en el template
+            models.execute_kw(db_odoo, uid, password, "product.template", "write",
+                [[tmpl_id], {"uom_id": uom_id, "uom_po_id": uom_id}])
+
+            # Restaurar stock
+            for q in quants:
+                models.execute_kw(db_odoo, uid, password, "stock.quant", "write",
+                    [[q["id"]], {"quantity": q["quantity"]}])
+
+            actualizados += 1
+        except Exception as e:
+            errores.append(f"{grl_code}: {e}")
+
+    return actualizados, sin_cambio, errores
+
+
+def subir_boms_kit(url, db_odoo, uid, password, boms_data):
+    """
+    Sube BoMs como tipo Kit (phantom) a Odoo.
+    boms_data: lista de dicts de _sugerir_boms_producto.
+    Retorna (creadas, actualizadas, omitidas, errores).
+    """
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
+
+    try:
+        models.execute_kw(db_odoo, uid, password, "mrp.bom", "search", [[]], {"limit": 1})
+    except Exception:
+        raise ValueError("El módulo de Fabricación (mrp) no está instalado en Odoo.")
+
+    uom_kg = _get_uom_kg(models, db_odoo, uid, password)
+    uom_unit = _get_uom_unit(models, db_odoo, uid, password)
+    uom_liter = _get_uom_liter(models, db_odoo, uid, password)
+
+    creadas, actualizadas, omitidas = 0, 0, 0
+    errores = []
+
+    for bom in boms_data:
+        cantidad = bom.get("cantidad", "")
+        notas = bom.get("notas", "")
+        sku_comp = bom.get("sku_componente", "")
+
+        if "verificar" in str(notas) or "verificar" in str(cantidad):
+            omitidas += 1
+            continue
+        if not sku_comp:
+            omitidas += 1
+            continue
+
+        qty, uom_id = _parse_bom_qty(cantidad, uom_unit, uom_kg, uom_liter)
+        if qty is None:
+            omitidas += 1
+            continue
+
+        try:
+            prods_final = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
+                [[["default_code", "=", bom["sku_final"]]]],
+                {"fields": ["id", "product_tmpl_id"]})
+            if not prods_final:
+                errores.append(f"{bom['sku_final']}: no encontrado en Odoo")
+                continue
+
+            prods_comp = models.execute_kw(db_odoo, uid, password, "product.product", "search_read",
+                [[["default_code", "=", sku_comp]]],
+                {"fields": ["id", "uom_id"]})
+            if not prods_comp:
+                errores.append(f"{sku_comp}: componente no encontrado en Odoo")
+                continue
+
+            comp_id = prods_comp[0]["id"]
+
+            # Usar siempre la UoM del componente para evitar conflictos de categoría
+            comp_uom = prods_comp[0].get("uom_id")
+            comp_uom_id = comp_uom[0] if isinstance(comp_uom, (list, tuple)) else uom_id
+
+            line_vals = {"product_id": comp_id, "product_qty": qty}
+            if comp_uom_id:
+                line_vals["product_uom_id"] = comp_uom_id
+
+            # Procesar todas las variantes con este SKU (puede haber duplicados por canal)
+            for prod_final in prods_final:
+                variant_id = prod_final["id"]
+                tmpl_id = prod_final["product_tmpl_id"][0]
+
+                existing = models.execute_kw(db_odoo, uid, password, "mrp.bom", "search",
+                    [[["product_id", "=", variant_id]]])
+
+                if existing:
+                    bom_id = existing[0]
+                    old_lines = models.execute_kw(db_odoo, uid, password, "mrp.bom.line", "search",
+                        [[["bom_id", "=", bom_id]]])
+                    if old_lines:
+                        models.execute_kw(db_odoo, uid, password, "mrp.bom.line", "unlink", [old_lines])
+                    models.execute_kw(db_odoo, uid, password, "mrp.bom", "write",
+                        [[bom_id], {"type": "phantom", "bom_line_ids": [(0, 0, line_vals)]}])
+                    actualizadas += 1
+                else:
+                    models.execute_kw(db_odoo, uid, password, "mrp.bom", "create", [{
+                        "product_tmpl_id": tmpl_id,
+                        "product_id": variant_id,
+                        "product_qty": 1,
+                        "type": "phantom",
+                        "bom_line_ids": [(0, 0, line_vals)],
+                    }])
+                    creadas += 1
+
+        except Exception as e:
+            errores.append(f"{bom['sku_final']}: {e}")
 
     return creadas, actualizadas, omitidas, errores

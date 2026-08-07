@@ -46,6 +46,7 @@ def _fmt_tiendas(raw):
     return ", ".join(_TIENDA_ABREV.get(t, t) for t in lst) or "—"
 
 
+
 class MainWindow(QMainWindow):
 
     def __init__(self):
@@ -85,15 +86,13 @@ class MainWindow(QMainWindow):
         self.btn_nuevo = QPushButton("Nuevo")
         self.btn_editar = QPushButton("Editar")
         self.btn_eliminar = QPushButton("Eliminar")
-        self.btn_importar = QPushButton("Importar Pedix")
-        self.btn_odoo = QPushButton("Subir a Odoo")
         self.btn_exportar = QPushButton("Exportar Excel")
         self.btn_bom = QPushButton("Exportar BoMs")
 
         for btn in [self.btn_nuevo, self.btn_editar, self.btn_eliminar,
-                    self.btn_importar, self.btn_odoo, self.btn_exportar,
-                    self.btn_bom]:
+                    self.btn_exportar, self.btn_bom]:
             btn_bar.addWidget(btn)
+        btn_bar.addStretch()
 
         self.btn_editar.setEnabled(False)
         self.btn_eliminar.setEnabled(False)
@@ -127,8 +126,6 @@ class MainWindow(QMainWindow):
         self.btn_nuevo.clicked.connect(self.nuevo_producto)
         self.btn_editar.clicked.connect(self.abrir_editar)
         self.btn_eliminar.clicked.connect(self.confirmar_eliminar)
-        self.btn_importar.clicked.connect(self.abrir_importar)
-        self.btn_odoo.clicked.connect(self.abrir_odoo)
         self.btn_exportar.clicked.connect(self.exportar_excel)
         self.btn_bom.clicked.connect(self.exportar_boms)
 
@@ -137,7 +134,7 @@ class MainWindow(QMainWindow):
         self._update_banner = QLabel("")
         self._update_banner.setAlignment(Qt.AlignCenter)
         self._update_banner.setStyleSheet(
-            "background:#1a6b3c; color:white; padding:6px; font-weight:bold; cursor:pointer;"
+            "background:#1a6b3c; color:white; padding:6px; font-weight:bold;"
         )
         self._update_banner.setCursor(Qt.PointingHandCursor)
         self._update_banner.setVisible(False)
@@ -311,13 +308,7 @@ class MainWindow(QMainWindow):
 
         session.close()
 
-    # ─── Import / Odoo / Export ─────────────────────────────────
-
-    def abrir_importar(self):
-        from ui.import_dialog import ImportarPedixDialog
-        dialog = ImportarPedixDialog(self)
-        if dialog.exec():
-            self.cargar_productos()
+    # ─── Export ─────────────────────────────────────────────────
 
     def exportar_boms(self):
         archivo, _ = QFileDialog.getSaveFileName(
@@ -340,11 +331,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", str(e))
         finally:
             session.close()
-
-    def abrir_odoo(self):
-        tabs = self.centralWidget()
-        # Configuración es la última pestaña (índice 3: Productos, Precios, Stock, Configuración)
-        tabs.setCurrentIndex(3)
 
     def exportar_excel(self):
         archivo, _ = QFileDialog.getSaveFileName(

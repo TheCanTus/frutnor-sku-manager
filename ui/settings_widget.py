@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QPushButton, QFormLayout, QLineEdit, QLabel,
     QMessageBox, QAbstractItemView, QInputDialog,
-    QGroupBox, QProgressBar,
+    QGroupBox, QProgressBar, QScrollArea, QFrame,
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
@@ -265,7 +265,8 @@ class _PresentacionesTab(QWidget):
         self._cargar()
 
 
-# ──────────────────────────────────────────────────────────────
+# ── Threads ────────────────────────────────────────────────────
+
 class _ComparacionThread(QThread):
     terminado = Signal(list, list)  # solo_odoo, solo_local
 
@@ -348,33 +349,110 @@ class _PreciosThread(QThread):
         self.terminado.emit(actualizados, sin_precio, errores)
 
 
-class _BomThread(QThread):
-    terminado = Signal(int, int, int, list)  # creadas, actualizadas, omitidas, errores
-
-    def __init__(self, url, db, uid, password, solo_nuevos=False):
-        super().__init__()
-        self._url, self._db, self._uid, self._password = url, db, uid, password
-        self._solo_nuevos = solo_nuevos
+class _SubirBomsKitThread(QThread):
+    done = Signal(int, int, int, list)   # creadas, actualizadas, omitidas, errores
+    error = Signal(str)
 
     def run(self):
-        from services.odoo_service import crear_boms
+        import json as _json
+        import xmlrpc.client
+
+        cfg_path = get_app_dir() / "config.json"
+        if not cfg_path.exists():
+            self.error.emit("No hay configuración de Odoo.")
+            return
+        cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        url = cfg.get("odoo_url", "").strip()
+        db = cfg.get("odoo_db", "").strip()
+        user = cfg.get("odoo_user", "").strip()
+        pwd = cfg.get("odoo_password", "").strip()
+        if not all([url, db, user, pwd]):
+            self.error.emit("Faltan datos de conexión a Odoo en Configuración.")
+            return
+
+        try:
+            uid = xmlrpc.client.ServerProxy(
+                f"{url}/xmlrpc/2/common", allow_none=True
+            ).authenticate(db, user, pwd, {})
+            if not uid:
+                self.error.emit("No se pudo autenticar en Odoo.")
+                return
+        except Exception as e:
+            self.error.emit(f"Error de conexión: {e}")
+            return
+
         from sqlalchemy.orm import joinedload
+        from services.bom_exporter import _sugerir_boms_producto
+        from services.odoo_service import subir_boms_kit
+
         session = SessionLocal()
         try:
-            skus = (
-                session.query(SKU)
-                .options(joinedload(SKU.producto))
-                .all()
-            )
-            creadas, actualizadas, omitidas, errores = crear_boms(
-                self._url, self._db, self._uid, self._password, skus,
-                solo_nuevos=self._solo_nuevos,
-            )
+            productos = (session.query(Producto)
+                         .options(joinedload(Producto.skus))
+                         .order_by(Producto.sku_base).all())
+            boms_data = []
+            for p in productos:
+                boms_data.extend(_sugerir_boms_producto(p))
         finally:
             session.close()
-        self.terminado.emit(creadas, actualizadas, omitidas, errores)
+
+        try:
+            creadas, actualizadas, omitidas, errores = subir_boms_kit(url, db, uid, pwd, boms_data)
+            self.done.emit(creadas, actualizadas, omitidas, errores)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
+class _CorregirUomThread(QThread):
+    done = Signal(int, int, list)   # actualizados, sin_cambio, errores
+    error = Signal(str)
+
+    def run(self):
+        import json as _json
+        import xmlrpc.client
+
+        cfg_path = get_app_dir() / "config.json"
+        if not cfg_path.exists():
+            self.error.emit("No hay configuración de Odoo.")
+            return
+        cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        url = cfg.get("odoo_url", "").strip()
+        db = cfg.get("odoo_db", "").strip()
+        user = cfg.get("odoo_user", "").strip()
+        pwd = cfg.get("odoo_password", "").strip()
+        if not all([url, db, user, pwd]):
+            self.error.emit("Faltan datos de conexión a Odoo.")
+            return
+        try:
+            uid = xmlrpc.client.ServerProxy(
+                f"{url}/xmlrpc/2/common", allow_none=True
+            ).authenticate(db, user, pwd, {})
+            if not uid:
+                self.error.emit("No se pudo autenticar en Odoo.")
+                return
+        except Exception as e:
+            self.error.emit(f"Error de conexión: {e}")
+            return
+
+        from sqlalchemy.orm import joinedload
+        from services.odoo_service import corregir_uom_granel
+
+        session = SessionLocal()
+        try:
+            productos = (session.query(Producto)
+                         .options(joinedload(Producto.skus))
+                         .order_by(Producto.sku_base).all())
+        finally:
+            session.close()
+
+        try:
+            actualizados, sin_cambio, errores = corregir_uom_granel(url, db, uid, pwd, productos)
+            self.done.emit(actualizados, sin_cambio, errores)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ──────────────────────────────────────────────────────────────
 class _OdooTab(QWidget):
 
     def __init__(self):
@@ -382,12 +460,28 @@ class _OdooTab(QWidget):
         self._uid = None
         self._cfg = _cargar_config()
 
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        # Scroll area externa — permite que el contenido sea más alto que la ventana
+        outer = QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(outer)
 
-        # ── Conexión ──
-        grp_con = QGroupBox("Conexión")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        layout = QVBoxLayout()
+        layout.setSpacing(16)
+        layout.setContentsMargins(10, 10, 10, 10)
+        content.setLayout(layout)
+        scroll.setWidget(content)
+
+        # ── Conexión ──────────────────────────────────────────
+        grp_con = QGroupBox("Conexión a Odoo")
         form = QFormLayout()
+        form.setContentsMargins(10, 12, 10, 10)
+        form.setSpacing(8)
         self.inp_url = QLineEdit(self._cfg.get("odoo_url", ""))
         self.inp_url.setPlaceholderText("https://miempresa.odoo.com")
         self.inp_db = QLineEdit(self._cfg.get("odoo_db", ""))
@@ -398,143 +492,164 @@ class _OdooTab(QWidget):
         form.addRow("Base de datos:", self.inp_db)
         form.addRow("Usuario:", self.inp_user)
         form.addRow("Contraseña:", self.inp_pass)
-        grp_con.setLayout(form)
-        layout.addWidget(grp_con)
 
         con_btns = QHBoxLayout()
         btn_guardar = QPushButton("Guardar")
         btn_guardar.clicked.connect(self._guardar)
         self.btn_test = QPushButton("Probar conexión")
         self.btn_test.clicked.connect(self._probar)
-        self.lbl_estado = QLabel("")
-        self.lbl_estado.setWordWrap(True)
-        self.lbl_estado.setMaximumWidth(400)
         con_btns.addWidget(btn_guardar)
         con_btns.addWidget(self.btn_test)
-        con_btns.addWidget(self.lbl_estado)
         con_btns.addStretch()
-        layout.addLayout(con_btns)
+        form.addRow("", con_btns)
 
-        # ── Sitios web de Odoo ──
+        self.lbl_estado = QLabel("")
+        self.lbl_estado.setWordWrap(True)
+        form.addRow("Estado:", self.lbl_estado)
+
+        grp_con.setLayout(form)
+        layout.addWidget(grp_con)
+
+        # ── Sitios web ────────────────────────────────────────
         grp_web = QGroupBox("Sitios web de Odoo")
-        web_layout = QVBoxLayout()
-
-        web_layout.addWidget(QLabel(
-            "Ingresá el ID numérico de cada sitio web en Odoo.\n"
-            "Podés encontrarlo en: Odoo → Sitio web → Configuración → mirá el número en la URL (/odoo/websites/N)."
-        ))
-
-        btn_buscar_sitios = QPushButton("Buscar sitios automáticamente")
-        btn_buscar_sitios.clicked.connect(self._buscar_sitios)
-        web_layout.addWidget(btn_buscar_sitios)
+        web_form = QFormLayout()
+        web_form.setContentsMargins(10, 12, 10, 10)
+        web_form.setSpacing(8)
 
         cfg_wids = self._cfg.get("website_ids") or {}
-        web_form = QFormLayout()
         self._inp_web_min = QLineEdit(str(cfg_wids.get("minorista") or ""))
         self._inp_web_may = QLineEdit(str(cfg_wids.get("mayorista") or ""))
         self._inp_web_prev = QLineEdit(str(cfg_wids.get("preventista") or ""))
         for inp in [self._inp_web_min, self._inp_web_may, self._inp_web_prev]:
-            inp.setPlaceholderText("ID numérico (ej: 1)")
+            inp.setPlaceholderText("ID numérico — ver /odoo/websites/N en Odoo")
         web_form.addRow("Minorista:", self._inp_web_min)
         web_form.addRow("Mayorista:", self._inp_web_may)
         web_form.addRow("Preventista:", self._inp_web_prev)
-        web_layout.addLayout(web_form)
 
-        btn_guardar_sitios = QPushButton("Guardar sitios")
+        web_btns = QHBoxLayout()
+        btn_buscar_sitios = QPushButton("Buscar automáticamente")
+        btn_buscar_sitios.setToolTip("Requiere conexión activa. Obtiene los IDs desde Odoo.")
+        btn_buscar_sitios.clicked.connect(self._buscar_sitios)
+        btn_guardar_sitios = QPushButton("Guardar")
         btn_guardar_sitios.clicked.connect(self._guardar_sitios)
-        web_layout.addWidget(btn_guardar_sitios)
+        web_btns.addWidget(btn_buscar_sitios)
+        web_btns.addWidget(btn_guardar_sitios)
+        web_btns.addStretch()
+        web_form.addRow("", web_btns)
 
-        grp_web.setLayout(web_layout)
+        grp_web.setLayout(web_form)
         layout.addWidget(grp_web)
 
-        # ── Subir a Odoo ──
-        grp_sub = QGroupBox("Subir productos a Odoo")
+        # ── Sincronización ────────────────────────────────────
+        grp_sub = QGroupBox("Sincronización con Odoo")
         sub_layout = QVBoxLayout()
+        sub_layout.setContentsMargins(10, 12, 10, 10)
+        sub_layout.setSpacing(10)
 
         self.progress_sub = QProgressBar()
         self.progress_sub.setVisible(False)
         sub_layout.addWidget(self.progress_sub)
 
-        btn_row1 = QHBoxLayout()
-        self.btn_preparar_grl = QPushButton("Preparar GRL (granel)")
+        # Preparar GRL
+        grl_row = QHBoxLayout()
+        self.btn_preparar_grl = QPushButton("Agregar presentación Granel (GRL)")
         self.btn_preparar_grl.setToolTip(
-            "Agrega presentación GRL a todos los productos de peso que aún no la tengan."
+            "Agrega la presentación GRL a todos los productos de peso que aún no la tengan.\n"
+            "Necesario antes de subir los SKUs de granel a Odoo."
         )
         self.btn_preparar_grl.clicked.connect(self._preparar_grl)
-        btn_row1.addWidget(self.btn_preparar_grl)
-        btn_row1.addStretch()
-        sub_layout.addLayout(btn_row1)
+        grl_row.addWidget(self.btn_preparar_grl)
+        grl_row.addStretch()
+        sub_layout.addLayout(grl_row)
 
-        btn_row2 = QHBoxLayout()
+        # Subir SKUs
+        sku_row = QHBoxLayout()
         self.btn_subir = QPushButton("Subir todos los SKUs")
         self.btn_subir.setEnabled(False)
         self.btn_subir.clicked.connect(self._subir)
         self.btn_subir_nuevos = QPushButton("Subir solo nuevos")
         self.btn_subir_nuevos.setEnabled(False)
-        self.btn_subir_nuevos.setToolTip(
-            "Solo sube los SKUs que todavía no están en Odoo (más rápido para sincronizaciones)."
-        )
+        self.btn_subir_nuevos.setToolTip("Solo sube los SKUs que todavía no están en Odoo.")
         self.btn_subir_nuevos.clicked.connect(self._subir_nuevos)
-        btn_row2.addWidget(self.btn_subir)
-        btn_row2.addWidget(self.btn_subir_nuevos)
-        btn_row2.addStretch()
-        sub_layout.addLayout(btn_row2)
+        sku_row.addWidget(self.btn_subir)
+        sku_row.addWidget(self.btn_subir_nuevos)
+        sku_row.addStretch()
+        sub_layout.addLayout(sku_row)
 
-        btn_row3 = QHBoxLayout()
-        self.btn_subir_precios = QPushButton("Actualizar precios en Odoo")
+        # Precios y BoMs
+        sync_row2 = QHBoxLayout()
+        self.btn_subir_precios = QPushButton("Actualizar precios")
         self.btn_subir_precios.setEnabled(False)
         self.btn_subir_precios.setToolTip(
             "Actualiza list_price y price_extra en los templates ya existentes en Odoo.\n"
-            "No crea ni elimina productos — solo aplica los precios cargados en la pestaña Precios."
+            "No crea ni elimina productos — solo aplica los precios de la pestaña Precios."
         )
         self.btn_subir_precios.clicked.connect(self._subir_precios)
-        btn_row3.addWidget(self.btn_subir_precios)
-        btn_row3.addStretch()
-        sub_layout.addLayout(btn_row3)
+
+        self.btn_subir_boms = QPushButton("Subir BoMs Kit a Odoo")
+        self.btn_subir_boms.setToolTip(
+            "Crea o actualiza las listas de materiales (tipo Kit) en Odoo.\n"
+            "Permite que al confirmar un pedido se descuente automáticamente el componente correcto del stock."
+        )
+        self.btn_subir_boms.clicked.connect(self._subir_boms_kit)
+        self.progress_boms = QProgressBar()
+        self.progress_boms.setVisible(False)
+
+        sync_row2.addWidget(self.btn_subir_precios)
+        sync_row2.addWidget(self.btn_subir_boms)
+        sync_row2.addStretch()
+        sub_layout.addLayout(sync_row2)
+        sub_layout.addWidget(self.progress_boms)
 
         grp_sub.setLayout(sub_layout)
         layout.addWidget(grp_sub)
 
-        # ── Listas de materiales (BoM) ──
-        grp_bom = QGroupBox("Listas de materiales (BoM)")
-        bom_layout = QVBoxLayout()
+        # ── Mantenimiento ─────────────────────────────────────
+        grp_mant = QGroupBox("Mantenimiento")
+        mant_layout = QVBoxLayout()
+        mant_layout.setContentsMargins(10, 12, 10, 10)
+        mant_layout.setSpacing(10)
 
-        bom_layout.addWidget(QLabel(
-            "Crea las BoMs en Odoo para presentaciones de peso (G/K).\n"
-            "Requiere que los productos y sus granel ya estén subidos a Odoo."
-        ))
-
-        self.progress_bom = QProgressBar()
-        self.progress_bom.setVisible(False)
-        bom_layout.addWidget(self.progress_bom)
-
-        bom_btn_row = QHBoxLayout()
-        self.btn_boms_todas = QPushButton("Crear / actualizar todas las BoMs")
-        self.btn_boms_todas.setEnabled(False)
-        self.btn_boms_todas.setToolTip(
-            "Crea BoMs nuevas y actualiza las cantidades de las ya existentes."
+        mant_row = QHBoxLayout()
+        self.btn_corregir_uom = QPushButton("Corregir UoM Graneles")
+        self.btn_corregir_uom.setToolTip(
+            "Cambia la unidad de medida de los productos granel de 'Unidades' a 'kg' en Odoo.\n"
+            "Solo necesario si los graneles se subieron originalmente en unidades."
         )
-        self.btn_boms_todas.clicked.connect(self._crear_boms_todas)
+        self.btn_corregir_uom.clicked.connect(self._corregir_uom_granel)
 
-        self.btn_boms_nuevas = QPushButton("Solo BoMs nuevas")
-        self.btn_boms_nuevas.setEnabled(False)
-        self.btn_boms_nuevas.setToolTip(
-            "Solo crea BoMs para variantes que todavía no tienen ninguna. "
-            "No toca las existentes (ideal para sincronizar productos nuevos)."
+        self.btn_comparar = QPushButton("Comparar Odoo vs BD local")
+        self.btn_comparar.setEnabled(False)
+        self.btn_comparar.setToolTip(
+            "Muestra qué SKUs están en Odoo pero no en la base local, y viceversa."
         )
-        self.btn_boms_nuevas.clicked.connect(self._crear_boms_nuevas)
+        self.btn_comparar.clicked.connect(self._comparar)
 
-        bom_btn_row.addWidget(self.btn_boms_todas)
-        bom_btn_row.addWidget(self.btn_boms_nuevas)
-        bom_btn_row.addStretch()
-        bom_layout.addLayout(bom_btn_row)
+        mant_row.addWidget(self.btn_corregir_uom)
+        mant_row.addWidget(self.btn_comparar)
+        mant_row.addStretch()
+        mant_layout.addLayout(mant_row)
 
-        grp_bom.setLayout(bom_layout)
-        layout.addWidget(grp_bom)
+        self.progress_cmp = QProgressBar()
+        self.progress_cmp.setVisible(False)
+        mant_layout.addWidget(self.progress_cmp)
 
-        # ── Actualizaciones ──
+        sub_tabs = QTabWidget()
+        self.tabla_solo_odoo = self._make_tabla(["SKU solo en Odoo (no está en la BD local)"])
+        self.tabla_solo_local = self._make_tabla(["SKU solo en BD local (no subido a Odoo)"])
+        sub_tabs.addTab(self._wrap(self.tabla_solo_odoo), "Solo en Odoo (0)")
+        sub_tabs.addTab(self._wrap(self.tabla_solo_local), "Sin subir a Odoo (0)")
+        self._sub_tabs = sub_tabs
+        mant_layout.addWidget(sub_tabs)
+
+        grp_mant.setLayout(mant_layout)
+        layout.addWidget(grp_mant)
+
+        # ── Actualizaciones ───────────────────────────────────
         grp_upd = QGroupBox("Actualizaciones automáticas")
         upd_layout = QFormLayout()
+        upd_layout.setContentsMargins(10, 12, 10, 10)
+        upd_layout.setSpacing(8)
         self._inp_gh_token = QLineEdit(self._cfg.get("github_token", ""))
         self._inp_gh_token.setEchoMode(QLineEdit.Password)
         self._inp_gh_token.setPlaceholderText("ghp_xxxx… (solo para repositorios privados)")
@@ -549,33 +664,9 @@ class _OdooTab(QWidget):
         grp_upd.setLayout(upd_layout)
         layout.addWidget(grp_upd)
 
-        # ── Comparación ──
-        grp_cmp = QGroupBox("Comparar Odoo vs base de datos local")
-        cmp_layout = QVBoxLayout()
-
-        self.btn_comparar = QPushButton("Comparar ahora")
-        self.btn_comparar.setEnabled(False)
-        self.btn_comparar.clicked.connect(self._comparar)
-        self.progress_cmp = QProgressBar()
-        self.progress_cmp.setVisible(False)
-        cmp_layout.addWidget(self.btn_comparar)
-        cmp_layout.addWidget(self.progress_cmp)
-
-        sub_tabs = QTabWidget()
-
-        self.tabla_solo_odoo = self._make_tabla(["SKU solo en Odoo (no está en la BD local)"])
-        self.tabla_solo_local = self._make_tabla(["SKU solo en BD local (no subido a Odoo)"])
-        sub_tabs.addTab(self._wrap(self.tabla_solo_odoo), "Solo en Odoo (0)")
-        sub_tabs.addTab(self._wrap(self.tabla_solo_local), "Sin subir a Odoo (0)")
-        self._sub_tabs = sub_tabs
-
-        cmp_layout.addWidget(sub_tabs)
-        grp_cmp.setLayout(cmp_layout)
-        layout.addWidget(grp_cmp)
-
         layout.addStretch()
 
-    # ── helpers ──
+    # ── helpers ───────────────────────────────────────────────
 
     @staticmethod
     def _make_tabla(headers):
@@ -623,8 +714,6 @@ class _OdooTab(QWidget):
             self.btn_subir_nuevos.setEnabled(True)
             self.btn_subir_precios.setEnabled(True)
             self.btn_comparar.setEnabled(True)
-            self.btn_boms_todas.setEnabled(True)
-            self.btn_boms_nuevas.setEnabled(True)
             self._guardar_silencioso()
         except Exception as e:
             self._uid = None
@@ -632,14 +721,11 @@ class _OdooTab(QWidget):
             self.btn_subir_nuevos.setEnabled(False)
             self.btn_subir_precios.setEnabled(False)
             self.btn_comparar.setEnabled(False)
-            self.btn_boms_todas.setEnabled(False)
-            self.btn_boms_nuevas.setEnabled(False)
             msg = str(e)
             if len(msg) > 120:
                 msg = msg[:120] + "…"
             self.lbl_estado.setText(f"✘ {msg}")
             self.lbl_estado.setStyleSheet("color: red;")
-            self.lbl_estado.setWordWrap(True)
 
     def _guardar_silencioso(self):
         url, db, user, pwd = self._credenciales()
@@ -678,7 +764,6 @@ class _OdooTab(QWidget):
             f"Sitios disponibles en Odoo:\n\n{sitios_txt}\n\n"
             "Ingresá el ID que corresponde a cada tienda en los campos de abajo y guardá."
         )
-        # Pre-rellenar si ya hay IDs guardados que coinciden
         cfg = _cargar_config()
         wids = cfg.get("website_ids") or {}
         for inp, key in [
@@ -724,7 +809,7 @@ class _OdooTab(QWidget):
         else:
             QMessageBox.information(
                 self, "Sin cambios",
-                "Todos los productos de peso ya tienen presentación GRL, o no hay productos de peso en la base de datos.",
+                "Todos los productos de peso ya tienen presentación GRL.",
             )
 
     def _subir(self, solo_nuevos=False):
@@ -751,10 +836,10 @@ class _OdooTab(QWidget):
         self.btn_subir_precios.setEnabled(False)
         self._thread_precios = _PreciosThread(url, db, self._uid, pwd)
         self._thread_precios.terminado.connect(self._on_precios_terminado)
+        self._thread_precios.finished.connect(lambda: self.progress_sub.setVisible(False))
         self._thread_precios.start()
 
     def _on_precios_terminado(self, actualizados, sin_precio, errores):
-        self.progress_sub.setVisible(False)
         self.btn_subir_precios.setEnabled(True)
         msg = (
             f"Templates actualizados: {actualizados}\n"
@@ -777,42 +862,67 @@ class _OdooTab(QWidget):
             msg += f"\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
         QMessageBox.information(self, "Subida completada", msg)
 
+    def _subir_boms_kit(self):
+        self.btn_subir_boms.setEnabled(False)
+        self.btn_subir_boms.setText("Subiendo BoMs…")
+        self.progress_boms.setVisible(True)
+        self.progress_boms.setRange(0, 0)
+        self._thread_boms = _SubirBomsKitThread()
+        self._thread_boms.done.connect(self._on_boms_kit_listo)
+        self._thread_boms.error.connect(self._on_boms_kit_error)
+        self._thread_boms.finished.connect(lambda: (
+            self.btn_subir_boms.setEnabled(True),
+            self.btn_subir_boms.setText("Subir BoMs Kit a Odoo"),
+            self.progress_boms.setVisible(False),
+        ))
+        self._thread_boms.start()
+
+    def _on_boms_kit_listo(self, creadas, actualizadas, omitidas, errores):
+        msg = (
+            f"BoMs Kit subidas a Odoo:\n"
+            f"  Creadas:      {creadas}\n"
+            f"  Actualizadas: {actualizadas}\n"
+            f"  Omitidas:     {omitidas} (verificación manual o sin componente)\n"
+        )
+        if errores:
+            detalle = "\n".join(errores[:20])
+            if len(errores) > 20:
+                detalle += f"\n… y {len(errores) - 20} más"
+            QMessageBox.warning(self, "BoMs subidas con errores",
+                                msg + f"\nErrores ({len(errores)}):\n{detalle}")
+        else:
+            QMessageBox.information(self, "Listo", msg)
+
+    def _on_boms_kit_error(self, msg):
+        QMessageBox.critical(self, "Error al subir BoMs", msg)
+
+    def _corregir_uom_granel(self):
+        self.btn_corregir_uom.setEnabled(False)
+        self.btn_corregir_uom.setText("Corrigiendo UoM…")
+        self._thread_uom = _CorregirUomThread()
+        self._thread_uom.done.connect(self._on_uom_listo)
+        self._thread_uom.error.connect(
+            lambda msg: QMessageBox.critical(self, "Error", msg)
+        )
+        self._thread_uom.finished.connect(lambda: (
+            self.btn_corregir_uom.setEnabled(True),
+            self.btn_corregir_uom.setText("Corregir UoM Graneles"),
+        ))
+        self._thread_uom.start()
+
+    def _on_uom_listo(self, actualizados, sin_cambio, errores):
+        msg = f"UoM corregidas: {actualizados}\nSin cambio: {sin_cambio}"
+        if errores:
+            msg += f"\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
+            QMessageBox.warning(self, "UoM Graneles", msg)
+        else:
+            QMessageBox.information(self, "Listo", msg)
+
     def _guardar_token(self):
         cfg = _cargar_config()
         cfg["github_token"] = self._inp_gh_token.text().strip()
         _guardar_config(cfg)
         QMessageBox.information(self, "Guardado", "Token guardado correctamente.")
-
-    def _crear_boms_todas(self):
-        self._crear_boms(solo_nuevos=False)
-
-    def _crear_boms_nuevas(self):
-        self._crear_boms(solo_nuevos=True)
-
-    def _crear_boms(self, solo_nuevos=False):
-        if not self._uid:
-            return
-        url, db, _, pwd = self._credenciales()
-        self.progress_bom.setVisible(True)
-        self.progress_bom.setRange(0, 0)
-        self.btn_boms_todas.setEnabled(False)
-        self.btn_boms_nuevas.setEnabled(False)
-        self._thread_bom = _BomThread(url, db, self._uid, pwd, solo_nuevos=solo_nuevos)
-        self._thread_bom.terminado.connect(self._on_bom_terminado)
-        self._thread_bom.start()
-
-    def _on_bom_terminado(self, creadas, actualizadas, omitidas, errores):
-        self.progress_bom.setVisible(False)
-        self.btn_boms_todas.setEnabled(True)
-        self.btn_boms_nuevas.setEnabled(True)
-        msg = (
-            f"BoMs creadas:     {creadas}\n"
-            f"BoMs actualizadas: {actualizadas}\n"
-            f"Omitidas (sin GRL en Odoo o no es peso): {omitidas}"
-        )
-        if errores:
-            msg += f"\n\nErrores ({len(errores)}):\n" + "\n".join(errores[:15])
-        QMessageBox.information(self, "BoMs completadas", msg)
 
     def _comparar(self):
         if not self._uid:

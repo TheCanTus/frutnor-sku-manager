@@ -3,9 +3,9 @@ import json
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QProgressBar, QMessageBox,
+    QProgressBar, QMessageBox, QLineEdit,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
 from PySide6.QtGui import QColor
 
 from database.db import SessionLocal
@@ -70,8 +70,9 @@ class _DescargaThread(QThread):
             self.error.emit(str(e))
 
 
+
 class _ActualizaThread(QThread):
-    done = Signal(int, list)
+    done = Signal(int, list, list)  # actualizados, errores, omitidos
     error = Signal(str)
 
     def __init__(self, url, db, uid, password, items):
@@ -82,10 +83,10 @@ class _ActualizaThread(QThread):
     def run(self):
         from services.odoo_service import actualizar_stock
         try:
-            actualizados, errores = actualizar_stock(
+            actualizados, errores, omitidos = actualizar_stock(
                 self._url, self._db, self._uid, self._password, self._items
             )
-            self.done.emit(actualizados, errores)
+            self.done.emit(actualizados, errores, omitidos)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -123,6 +124,15 @@ class StockWidget(QWidget):
         self.progress.setRange(0, 0)
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Buscar por producto o categoría…")
+        layout.addWidget(self.search)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._filtrar)
+        self.search.textChanged.connect(self._search_timer.start)
 
         self.tabla = QTableWidget()
         self.tabla.setColumnCount(5)
@@ -191,6 +201,17 @@ class StockWidget(QWidget):
         self.btn_guardar.setEnabled(False)
         self._cargado = True
         self.lbl_estado.setText(f"{len(filas)} productos")
+        self._filtrar()
+
+    def _filtrar(self):
+        texto = self.search.text().strip().lower()
+        for row in range(self.tabla.rowCount()):
+            if not texto:
+                self.tabla.setRowHidden(row, False)
+                continue
+            cat = (self.tabla.item(row, _COL_CAT) or QTableWidgetItem("")).text().lower()
+            prod = (self.tabla.item(row, _COL_PROD) or QTableWidgetItem("")).text().lower()
+            self.tabla.setRowHidden(row, texto not in prod and texto not in cat)
 
     def _on_item_changed(self, item):
         if not self._cargado:
@@ -262,8 +283,8 @@ class StockWidget(QWidget):
 
     def _set_busy(self, busy):
         self.progress.setVisible(busy)
-        self.btn_descargar.setEnabled(not busy)
-        self.btn_actualizar.setEnabled(not busy)
+        for b in [self.btn_descargar, self.btn_actualizar]:
+            b.setEnabled(not busy)
 
     def _descargar_odoo(self):
         url, db, uid, pwd = self._conectar_odoo()
@@ -335,15 +356,24 @@ class StockWidget(QWidget):
         self._set_busy(True)
         self.lbl_estado.setText("Actualizando en Odoo…")
         self._thread_act = _ActualizaThread(url, db, uid, pwd, items)
-        self._thread_act.done.connect(self._on_actualizacion_lista)
+        self._thread_act.done.connect(self._on_actualizacion_lista)  # type: ignore[arg-type]
         self._thread_act.error.connect(self._on_actualizacion_error)
         self._thread_act.finished.connect(lambda: self._set_busy(False))
         self._thread_act.start()
 
-    def _on_actualizacion_lista(self, actualizados, errores):
+    def _on_actualizacion_lista(self, actualizados, errores, omitidos):
         msg = f"Stock actualizado: {actualizados} producto(s)"
+        if omitidos:
+            msg += (
+                f"\n\nOmitidos ({len(omitidos)}) — no son Almacenables en Odoo:\n"
+                + "\n".join(omitidos[:15])
+            )
+            if len(omitidos) > 15:
+                msg += f"\n… y {len(omitidos) - 15} más"
+            msg += "\n\nPara cargarles stock, cambiá su tipo a 'Almacenable' en Odoo."
         if errores:
             msg += f"\n\nErrores ({len(errores)}):\n" + "\n".join(errores[:10])
+        if errores or omitidos:
             QMessageBox.warning(self, "Resultado", msg)
         else:
             QMessageBox.information(self, "Listo", msg)

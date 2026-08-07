@@ -38,8 +38,8 @@ def _parse_pres(codigo):
     if c == "SET":
         return (1, "unit")
 
-    # Peso en gramos: 50G, 100G, 250G, 500G, 800G
-    m = re.match(r"^(\d+)G$", c)
+    # Peso en gramos: 50G, 100G, 250G, 500G, 800G / trozos (T) / pulpa (P)
+    m = re.match(r"^(\d+)[GTP]$", c)
     if m:
         return (int(m.group(1)), "weight")
 
@@ -76,6 +76,17 @@ def _es_sabor(codigo):
     return codigo.upper() in SABORES
 
 
+def _parse_pack_pres(codigo):
+    """
+    Detecta packs tipo 6X250 → (6, 250): 6 unidades de la presentación de 250ml/g.
+    Retorna (count, base_size) o None.
+    """
+    m = re.match(r"^(\d+)X(\d+)$", codigo.upper())
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
 # ── Lógica de sugerencias ────────────────────────────────────────────────────
 
 def _sugerir_boms_producto(producto):
@@ -88,12 +99,18 @@ def _sugerir_boms_producto(producto):
         return []
 
     # Separar por tipo
-    grupos = {}  # tipo → [(valor, sku_obj)]
+    grupos = {}        # tipo → [(valor, sku_obj)]
     sabores = []
+    pack_skus = []     # (count, base_size, sku_obj) para packs nXm
 
     for s in skus:
         if _es_sabor(s.presentacion):
             sabores.append(s)
+            continue
+        pack = _parse_pack_pres(s.presentacion)
+        if pack:
+            count, base_size = pack
+            pack_skus.append((count, base_size, s))
             continue
         parsed = _parse_pres(s.presentacion)
         if parsed is None:
@@ -158,6 +175,8 @@ def _sugerir_boms_producto(producto):
                 for i in range(len(items_sorted) - 1, 0, -1):
                     val_fin, sku_fin = items_sorted[i - 1]   # más chico = producto final
                     val_comp, sku_comp = items_sorted[i]     # más grande = componente/fuente
+                    if val_fin == val_comp:
+                        continue  # mismo tamaño pero distinto tipo (ej: trozos vs pulpa)
                     if val_fin > 0 and val_comp % val_fin == 0:
                         cantidad = int(val_comp / val_fin)
                         boms.append({
@@ -179,6 +198,53 @@ def _sugerir_boms_producto(producto):
                             "tipo": tipo_label,
                             "notas": "Relación no múltiplo exacto, revisar",
                         })
+
+    # Packs nXm: 6X250 → BoM: 6× la presentación de 250ml/g
+    if pack_skus:
+        size_by_val = {}
+        for tipo_k, items_k in grupos.items():
+            if tipo_k in ("volume", "weight"):
+                for v, s in items_k:
+                    size_by_val[v] = s
+        for count, base_size, pack_sku in pack_skus:
+            base_sku = size_by_val.get(base_size)
+            if base_sku:
+                boms.append({
+                    "producto_final": f"{producto.nombre} ({pack_sku.presentacion})",
+                    "sku_final": pack_sku.sku,
+                    "componente": f"{producto.nombre} ({base_sku.presentacion})",
+                    "sku_componente": base_sku.sku,
+                    "cantidad": count,
+                    "tipo": "Pack de unidades",
+                    "notas": "",
+                })
+            else:
+                # Fallback: usar granel con peso total si existe
+                granel_sku = next(
+                    (s for v, s in grupos.get("weight", []) if v == float("inf")),
+                    None,
+                )
+                if granel_sku:
+                    total_g = count * base_size
+                    boms.append({
+                        "producto_final": f"{producto.nombre} ({pack_sku.presentacion})",
+                        "sku_final": pack_sku.sku,
+                        "componente": f"{producto.nombre} ({granel_sku.presentacion})",
+                        "sku_componente": granel_sku.sku,
+                        "cantidad": f"{total_g}g",
+                        "tipo": "Pack de unidades",
+                        "notas": "",
+                    })
+                else:
+                    boms.append({
+                        "producto_final": f"{producto.nombre} ({pack_sku.presentacion})",
+                        "sku_final": pack_sku.sku,
+                        "componente": f"— presentación de {base_size} no encontrada",
+                        "sku_componente": "",
+                        "cantidad": count,
+                        "tipo": "Pack de unidades",
+                        "notas": f"No hay presentación de {base_size}ml/g en la DB — verificar manualmente",
+                    })
 
     return boms
 
