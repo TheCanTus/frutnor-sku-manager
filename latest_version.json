@@ -1,5 +1,5 @@
 {
-  "version": "1.5.0",
-  "url": "https://github.com/TheCanTus/frutnor-sku-manager/releases/download/v1.5.0/SKU_Generator.exe",
-  "notes": "Base de datos en la nube (Supabase): múltiples PCs comparten la misma base de datos. Interfaz de configuración reorganizada con scroll. Operaciones de mantenimiento movidas a Configuración."
+  "version": "1.5.1",
+  "url": "https://github.com/TheCanTus/frutnor-sku-manager/releases/download/v1.5.1/SKU_Generator.exe",
+  "notes": "Correcciones de estabilidad: crashes de inicio y queries con PostgreSQL."
 }
