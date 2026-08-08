@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from sqlalchemy import or_
+from sqlalchemy.orm import joinedload
 
 from database.db import SessionLocal
 from database.models import SKU, Producto, Categoria, Presentacion
@@ -175,14 +176,24 @@ class MainWindow(QMainWindow):
 
     def cargar_productos(self):
         session = SessionLocal()
-        registros = session.query(SKU).order_by(SKU.sku).all()
+        registros = (
+            session.query(SKU)
+            .options(joinedload(SKU.producto).joinedload(Producto.categoria))
+            .order_by(SKU.sku)
+            .all()
+        )
         self.llenar_tabla(registros)
         session.close()
 
     def buscar_productos(self):
         texto = self.search.text().strip()
         session = SessionLocal()
-        query = session.query(SKU).join(Producto).join(Categoria)
+        query = (
+            session.query(SKU)
+            .options(joinedload(SKU.producto).joinedload(Producto.categoria))
+            .join(Producto)
+            .join(Categoria)
+        )
         if texto:
             query = query.filter(
                 or_(

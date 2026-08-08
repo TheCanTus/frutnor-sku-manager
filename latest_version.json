@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
-  "url": "https://github.com/TheCanTus/frutnor-sku-manager/releases/download/v1.2.0/SKU_Generator.exe",
-  "notes": "Tiendas por presentación: cada presentación puede asignarse a distintas tiendas (minorista/mayorista/preventista) en forma independiente. Sistema de aliases para normalizar nombres distintos entre Pedix y la BD. Packs mayorista reconocidos como presentación compuesta (x3u 200cc → 3X200C). Creación y actualización de listas de materiales (BoMs) en Odoo. Buscador con debounce (sin freezing). Configuración manual de sitios web."
+  "version": "1.5.0",
+  "url": "https://github.com/TheCanTus/frutnor-sku-manager/releases/download/v1.5.0/SKU_Generator.exe",
+  "notes": "Base de datos en la nube (Supabase): múltiples PCs comparten la misma base de datos. Interfaz de configuración reorganizada con scroll. Operaciones de mantenimiento movidas a Configuración."
 }

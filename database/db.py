@@ -26,20 +26,6 @@ if DATABASE_URL.startswith("sqlite"):
         echo=False,
         connect_args={"check_same_thread": False},
     )
-    # Migraciones SQLite legacy (solo aplica en modo local)
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        cols_skus = {row[1] for row in conn.execute(text("PRAGMA table_info(skus)")).fetchall()}
-        if "precios" not in cols_skus:
-            conn.execute(text("ALTER TABLE skus ADD COLUMN precios TEXT DEFAULT '{}'"))
-            conn.commit()
-        cols_prod = {row[1] for row in conn.execute(text("PRAGMA table_info(productos)")).fetchall()}
-        if "stock" not in cols_prod:
-            conn.execute(text("ALTER TABLE productos ADD COLUMN stock REAL"))
-            conn.commit()
-        if "stock_unidad" not in cols_prod:
-            conn.execute(text("ALTER TABLE productos ADD COLUMN stock_unidad TEXT DEFAULT 'kg'"))
-            conn.commit()
 else:
     engine = create_engine(
         DATABASE_URL,

@@ -19,10 +19,19 @@ if engine.dialect.name == "sqlite":
         if "grupo" not in cols:
             conn.execute(text("ALTER TABLE productos ADD COLUMN grupo VARCHAR"))
             conn.commit()
+        if "stock" not in cols:
+            conn.execute(text("ALTER TABLE productos ADD COLUMN stock REAL"))
+            conn.commit()
+        if "stock_unidad" not in cols:
+            conn.execute(text("ALTER TABLE productos ADD COLUMN stock_unidad TEXT DEFAULT 'kg'"))
+            conn.commit()
 
         sku_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(skus)"))]
         if "tiendas" not in sku_cols:
             conn.execute(text('ALTER TABLE skus ADD COLUMN tiendas TEXT DEFAULT \'["minorista"]\''))
+            conn.commit()
+        if "precios" not in sku_cols:
+            conn.execute(text("ALTER TABLE skus ADD COLUMN precios TEXT DEFAULT '{}'"))
             conn.commit()
 
 
