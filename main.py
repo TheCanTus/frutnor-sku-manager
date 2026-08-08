@@ -12,17 +12,18 @@ from version import VERSION
 
 Base.metadata.create_all(bind=engine)
 
-# Migración: agregar columna 'grupo' si no existe
-with engine.connect() as conn:
-    cols = [row[1] for row in conn.execute(text("PRAGMA table_info(productos)"))]
-    if "grupo" not in cols:
-        conn.execute(text("ALTER TABLE productos ADD COLUMN grupo VARCHAR"))
-        conn.commit()
+# Migraciones legacy — solo SQLite (PRAGMA no existe en PostgreSQL)
+if engine.dialect.name == "sqlite":
+    with engine.connect() as conn:
+        cols = [row[1] for row in conn.execute(text("PRAGMA table_info(productos)"))]
+        if "grupo" not in cols:
+            conn.execute(text("ALTER TABLE productos ADD COLUMN grupo VARCHAR"))
+            conn.commit()
 
-    sku_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(skus)"))]
-    if "tiendas" not in sku_cols:
-        conn.execute(text('ALTER TABLE skus ADD COLUMN tiendas TEXT DEFAULT \'["minorista"]\''))
-        conn.commit()
+        sku_cols = [row[1] for row in conn.execute(text("PRAGMA table_info(skus)"))]
+        if "tiendas" not in sku_cols:
+            conn.execute(text('ALTER TABLE skus ADD COLUMN tiendas TEXT DEFAULT \'["minorista"]\''))
+            conn.commit()
 
 
 class _UpdateChecker(QThread):
