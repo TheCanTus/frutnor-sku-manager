@@ -37,7 +37,7 @@ def verificar_actualizacion(token: str = ""):
         if _ver_tuple(tag) > _ver_tuple(VERSION):
             for asset in data.get("assets", []):
                 if asset["name"].lower().endswith(".exe"):
-                    return tag, asset["browser_download_url"], notas
+                    return tag, asset["url"], notas
     except Exception:
         pass
     return None
@@ -58,7 +58,10 @@ def descargar_e_instalar(download_url: str, token: str = "", progreso_callback=N
     exe_actual = Path(sys.executable).resolve()
     exe_nuevo = exe_actual.parent / (exe_actual.stem + "_update.exe")
 
-    headers = {"User-Agent": "SKUManager-Updater"}
+    headers = {
+        "User-Agent": "SKUManager-Updater",
+        "Accept": "application/octet-stream",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 

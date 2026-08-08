@@ -1,5 +1,5 @@
 {
-  "version": "1.5.1",
-  "url": "https://github.com/TheCanTus/frutnor-sku-manager/releases/download/v1.5.1/SKU_Generator.exe",
+  "version": "1.5.2",
+  "url": "https://github.com/TheCanTus/frutnor-sku-manager/releases/download/v1.5.2/SKU_Generator.exe",
   "notes": "Correcciones de estabilidad: crashes de inicio y queries con PostgreSQL."
 }
